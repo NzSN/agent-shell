@@ -834,7 +834,9 @@ handles viewport mode detection, existing shell reuse, and project context."
                                            :new-session t))
                       (t
                        (agent-shell--shell-buffer))))
-               (text (agent-shell--context :shell-buffer shell-buffer)))
+               (text (agent-shell--context
+                      :shell-buffer shell-buffer
+                      :sources (remove 'files agent-shell-context-sources))))
           (if (and (eq (buffer-local-value 'agent-shell-session-strategy shell-buffer) 'prompt)
                    (not (map-nested-elt (buffer-local-value 'agent-shell--state shell-buffer)
                                         '(:session :id))))
@@ -856,7 +858,9 @@ handles viewport mode detection, existing shell reuse, and project context."
                                      (mapcar #'buffer-name (or (agent-shell-buffers)
                                                                (user-error "No shells available")))
                                      nil t)))
-                  (text (agent-shell--context :shell-buffer shell-buffer)))
+                  (text (agent-shell--context
+                         :shell-buffer shell-buffer
+                         :sources (remove 'files agent-shell-context-sources))))
              (agent-shell--display-buffer shell-buffer)
              (when text
                (agent-shell--insert-to-shell-buffer :text text
@@ -870,13 +874,17 @@ handles viewport mode detection, existing shell reuse, and project context."
           (t
            (if (derived-mode-p 'agent-shell-mode)
                (let* ((shell-buffer (agent-shell--shell-buffer :no-create t))
-                      (text (agent-shell--context :shell-buffer shell-buffer)))
+                      (text (agent-shell--context
+                             :shell-buffer shell-buffer
+                             :sources (remove 'files agent-shell-context-sources))))
                  (agent-shell-toggle)
                  (when text
                    (agent-shell--insert-to-shell-buffer :text text
                                                         :shell-buffer shell-buffer)))
              (let* ((shell-buffer (agent-shell--shell-buffer))
-                    (text (agent-shell--context :shell-buffer shell-buffer)))
+                    (text (agent-shell--context
+                           :shell-buffer shell-buffer
+                           :sources (remove 'files agent-shell-context-sources))))
                (if (and (eq (buffer-local-value 'agent-shell-session-strategy shell-buffer) 'prompt)
                         (not (map-nested-elt (buffer-local-value 'agent-shell--state shell-buffer)
                                              '(:session :id))))
@@ -4696,11 +4704,40 @@ Returns list of alists with :start, :end, and :path for each mention."
       (setq pos (match-end 0)))
     (nreverse mentions)))
 
-(cl-defun agent-shell--build-content-blocks (prompt)
-  "Build content blocks from the PROMPT."
+(defun agent-shell--file-path-to-content-block (file-path)
+  "Convert FILE-PATH to a single ACP content block.
+Returns nil if the file cannot be read."
   (let* ((supports-embedded-context (map-nested-elt agent-shell--state '(:prompt-capabilities :embedded-context)))
          (supports-image (map-nested-elt agent-shell--state '(:prompt-capabilities :image)))
-         (mentions (agent-shell--parse-file-mentions prompt))
+         (resolved-path (agent-shell--resolve-path file-path))
+         (relative-path (file-relative-name file-path (agent-shell-cwd)))
+         (file (and (file-readable-p file-path)
+                    (agent-shell--read-file-content :file-path file-path))))
+    (cond
+     ((not file)
+      nil)
+     ((and supports-image (map-elt file :base64-p)
+           (string-prefix-p "image/" (map-elt file :mime-type)))
+      `((type . "image")
+        (data . ,(map-elt file :content))
+        (mimeType . ,(map-elt file :mime-type))
+        (uri . ,(concat "file://" resolved-path))))
+     ((and agent-shell-text-file-capabilities supports-embedded-context (map-elt file :size)
+           (< (map-elt file :size) agent-shell-embed-file-size-limit))
+      `((type . "resource")
+        (resource . ((uri . ,(concat "file://" resolved-path))
+                     (text . ,(map-elt file :content))
+                     (mimeType . ,(map-elt file :mime-type))))))
+     (t
+      `((type . "resource_link")
+        (uri . ,(concat "file://" resolved-path))
+        (name . ,relative-path)
+        (mimeType . ,(map-elt file :mime-type))
+        (size . ,(map-elt file :size)))))))
+
+(cl-defun agent-shell--build-content-blocks (prompt)
+  "Build content blocks from the PROMPT."
+  (let* ((mentions (agent-shell--parse-file-mentions prompt))
          (content-blocks '())
          (pos 0))
     (dolist (mention mentions)
@@ -4717,41 +4754,12 @@ Returns list of alists with :start, :end, and :path for each mention."
 
         ;; Try to embed or link file
         (condition-case nil
-            (let ((file (and (file-readable-p expanded-path)
-                             (agent-shell--read-file-content :file-path expanded-path))))
-              (cond
-               ;; File not readable - keep mention as text
-               ((not file)
-                (push `((type . "text")
-                        (text . ,(substring-no-properties prompt start end)))
-                      content-blocks))
-               ;; Binary image and image capability supported
-               ;; Use ContentBlock::Image
-               ((and supports-image (map-elt file :base64-p)
-                     (string-prefix-p "image/" (map-elt file :mime-type)))
-                (push `((type . "image")
-                        (data . ,(map-elt file :content))
-                        (mimeType . ,(map-elt file :mime-type))
-                        (uri . ,(concat "file://" resolved-path)))
-                      content-blocks))
-               ;; Text file, small enough, text file capabilities granted and embeddedContext supported
-               ;; Use ContentBlock::Resource
-               ((and agent-shell-text-file-capabilities supports-embedded-context (map-elt file :size)
-                     (< (map-elt file :size) agent-shell-embed-file-size-limit))
-                (push `((type . "resource")
-                        (resource . ((uri . ,(concat "file://" resolved-path))
-                                     (text . ,(map-elt file :content))
-                                     (mimeType . ,(map-elt file :mime-type)))))
-                      content-blocks))
-               ;; File too large, no text file capabilities granted or embeddedContext not supported
-               ;; Use resource link
-               (t
-                (push `((type . "resource_link")
-                        (uri . ,(concat "file://" resolved-path))
-                        (name . ,relative-path)
-                        (mimeType . ,(map-elt file :mime-type))
-                        (size . ,(map-elt file :size)))
-                      content-blocks))))
+            (if-let ((block (agent-shell--file-path-to-content-block expanded-path)))
+                (push block content-blocks)
+              ;; File not readable - keep mention as text
+              (push `((type . "text")
+                      (text . ,(substring-no-properties prompt start end)))
+                    content-blocks))
           (error
            ;; On error, just keep the mention as text
            (push `((type . "text")
@@ -4767,6 +4775,20 @@ Returns list of alists with :start, :end, and :path for each mention."
             content-blocks))
 
     (nreverse content-blocks)))
+
+(defun agent-shell--auto-file-context-blocks ()
+  "Return content blocks for the most recent non-shell file buffer.
+Returns nil if `files' is not in `agent-shell-context-sources'
+or no suitable buffer is found."
+  (when (memq 'files agent-shell-context-sources)
+    (when-let ((buf (seq-find (lambda (b)
+                                (and (not (eq b (current-buffer)))
+                                     (buffer-file-name b)
+                                     (with-current-buffer b
+                                       (not (derived-mode-p 'agent-shell-mode)))))
+                              (buffer-list))))
+      (when-let ((block (agent-shell--file-path-to-content-block (buffer-file-name buf))))
+        (list block)))))
 
 (cl-defun agent-shell--read-file-content (&key file-path shallow)
   "Read FILE-PATH and return metadata and content as an alist.
@@ -4878,6 +4900,18 @@ first-prompt title is left in place."
                              (agent-shell--build-content-blocks prompt)
                            (error `[((type . "text")
                                      (text . ,(substring-no-properties prompt)))])))
+         (auto-context-blocks (agent-shell--auto-file-context-blocks))
+         ;; Filter out auto-context blocks that duplicate existing file URIs
+         (existing-uris (seq-map (lambda (block)
+                                   (or (map-nested-elt block '(resource uri))
+                                       (map-elt block 'uri)))
+                                 content-blocks))
+         (filtered-auto-blocks (seq-remove (lambda (block)
+                                             (member (or (map-nested-elt block '(resource uri))
+                                                         (map-elt block 'uri))
+                                                     existing-uris))
+                                           auto-context-blocks))
+         (content-blocks (append filtered-auto-blocks content-blocks))
          (attached-files (agent-shell--collect-attached-files content-blocks)))
     (when attached-files
       (agent-shell--display-attached-files attached-files))
@@ -5990,7 +6024,9 @@ With \\[universal-argument] \\[universal-argument] prefix ARG, prompt to pick an
            (agent-shell--shell-buffer))
           (t
            (agent-shell--shell-buffer)))))
-    (agent-shell-insert :text (agent-shell--context :shell-buffer shell-buffer)
+    (agent-shell-insert :text (agent-shell--context
+                               :shell-buffer shell-buffer
+                               :sources (remove 'files agent-shell-context-sources))
                         :shell-buffer shell-buffer)))
 
 (cl-defun agent-shell--get-region-context (&key deactivate no-error agent-cwd)
@@ -6246,13 +6282,14 @@ Uses AGENT-CWD to shorten file paths where necessary."
       (activate-mark)
       (agent-shell--get-region-context :deactivate t :no-error t :agent-cwd agent-cwd))))
 
-(cl-defun agent-shell--context (&key shell-buffer)
+(cl-defun agent-shell--context (&key shell-buffer sources)
   "Return context (if available).  Nil otherwise.
 
 Uses optional SHELL-BUFFER to make paths relative to shell project.
 
 Context could be either a region or error at point or files.
-The sources checked are controlled by `agent-shell-context-sources'."
+The sources checked are controlled by `agent-shell-context-sources'
+or the optional SOURCES argument."
   (unless (and (derived-mode-p 'agent-shell-mode)
                (not (region-active-p)))
     (let ((agent-cwd (when shell-buffer
@@ -6262,7 +6299,9 @@ The sources checked are controlled by `agent-shell-context-sources'."
        (lambda (source)
          (pcase source
            ('files (agent-shell--get-files-context
-                    :files (agent-shell--buffer-files :obvious t)
+                    :files (or (agent-shell--buffer-files :obvious t)
+                               (when (buffer-file-name)
+                                 (list (buffer-file-name))))
                     :agent-cwd agent-cwd))
            ('region (agent-shell--get-region-context
                      :deactivate t :no-error t
@@ -6271,7 +6310,7 @@ The sources checked are controlled by `agent-shell-context-sources'."
            ('line (agent-shell--get-current-line-context
                    :agent-cwd agent-cwd))
            ((pred functionp) (funcall source))))
-       agent-shell-context-sources))))
+       (or sources agent-shell-context-sources)))))
 
 (cl-defun agent-shell--get-region (&key deactivate)
   "Get the active region as an alist.

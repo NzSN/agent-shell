@@ -120,7 +120,9 @@ Returns an alist with insertion details or nil otherwise:
       (pop-to-buffer-same-window current)))
   (when-let* ((shell-buffer (or shell-buffer (agent-shell--shell-buffer)))
               (viewport-buffer (agent-shell-viewport--buffer :shell-buffer shell-buffer))
-              (text (or append (agent-shell--context :shell-buffer shell-buffer) "")))
+              (text (or append (agent-shell--context
+                                :shell-buffer shell-buffer
+                                :sources (remove 'files agent-shell-context-sources)) "")))
     (when (and override (not (string-empty-p text)))
       (error "Cannot override"))
     (let ((insert-start nil)
