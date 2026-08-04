@@ -358,7 +358,8 @@ body un-fontified."
       (with-silent-modifications
         (remove-text-properties (point-min) (point-max)
                                 '(agent-shell-markdown-watermark nil
-                                  agent-shell-markdown-open-fence nil))))
+                                  agent-shell-markdown-open-fence nil
+                                  agent-shell-markdown-construct-activity nil))))
     (let ((open-fence (and (not force)
                            (> (point-max) (point-min))
                            (get-text-property (point-min)
@@ -382,13 +383,16 @@ body un-fontified."
                                        (insert (substring-no-properties s)))))
             (put-text-property (cdr open-fence) (point-max) 'fontified t))
       (let ((watermark (agent-shell-markdown--watermark-start))
-          (external-results)
-          (context)
-          (source-blocks)
-          (source-ranges)
-          (rendered-ranges)
-          (inline-ranges)
-          (avoid-ranges))
+            (external-results)
+            (context)
+            (source-blocks)
+            (source-ranges)
+            (rendered-ranges)
+            (inline-ranges)
+            (avoid-ranges)
+            (lists-rendered)
+            (blocks-rendered)
+            (tables-rendered))
       (save-restriction
         (narrow-to-region watermark (point-max))
         ;; Build the render context (fenced-block descriptors + inline
@@ -443,9 +447,11 @@ body un-fontified."
            :avoid-ranges avoid-ranges))
         (agent-shell-markdown--style-dividers :avoid-ranges avoid-ranges)
         (agent-shell-markdown--style-blockquotes :avoid-ranges avoid-ranges)
-        (agent-shell-markdown--style-lists :avoid-ranges avoid-ranges)
-        (agent-shell-markdown--style-source-blocks
-         :highlight-blocks highlight-blocks)
+        (setq lists-rendered
+              (agent-shell-markdown--style-lists :avoid-ranges avoid-ranges))
+        (setq blocks-rendered
+              (agent-shell-markdown--style-source-blocks
+               :highlight-blocks highlight-blocks))
         ;; Tables run last so cell content has already been processed by
         ;; every other pass (bold, italic, links, inline code, etc.).
         ;; The cell parser respects face and `agent-shell-markdown-frozen'
@@ -459,7 +465,8 @@ body un-fontified."
         ;; `--update-watermark'), so `--find-tables' under the narrow
         ;; always sees the existing `agent-shell-markdown-table-source'
         ;; needed to fold new rows in.
-        (agent-shell-markdown--style-tables :avoid-ranges source-ranges)
+        (setq tables-rendered
+              (agent-shell-markdown--style-tables :avoid-ranges source-ranges))
         ;; Restore backslash-escaped chars from their placeholders now that
         ;; every styling pass has run, before faces are mirrored below.
         (agent-shell-markdown--decode-escapes)
@@ -488,8 +495,22 @@ body un-fontified."
       ;; Frame rendered blocks with a blank line where they butt against
       ;; prose.  Runs outside the watermark narrow, since a block's lower
       ;; boundary sits behind the watermark by the time its successor
-      ;; streams in.
-      (agent-shell-markdown--pad-rendered-blocks)
+      ;; streams in.  The pass walks the whole body per call, so it only
+      ;; runs around construct activity: a pass that rendered (or
+      ;; re-rendered) a block/table/list, or the pass right after one
+      ;; (when a table or list stops extending, its bottom gap lands
+      ;; here).  Prose-only chunks skip the walk entirely.
+      (let ((activity (or lists-rendered blocks-rendered tables-rendered)))
+        (when (or force
+                  activity
+                  (and (> (point-max) (point-min))
+                       (get-text-property (point-min)
+                                          'agent-shell-markdown-construct-activity)))
+          (agent-shell-markdown--pad-rendered-blocks))
+        (when (> (point-max) (point-min))
+          (with-silent-modifications
+            (put-text-property (point-min) (1+ (point-min))
+                               'agent-shell-markdown-construct-activity activity))))
       (agent-shell-markdown--update-watermark
        :source-blocks source-blocks
        :external-candidates (seq-keep (lambda (result) (map-elt result :watermark))
@@ -1280,8 +1301,11 @@ becomes:
   (message \"hi\")
 
 with `emacs-lisp-mode' face properties on the body and a
-`agent-shell-markdown-frozen' tag covering those same chars."
-  (let ((case-fold-search nil))
+`agent-shell-markdown-frozen' tag covering those same chars.
+
+Returns non-nil when at least one block was rendered this call."
+  (let ((case-fold-search nil)
+        (rendered nil))
     (goto-char (point-min))
     ;; Group 2 captures the opening backtick run; `backref' on the
     ;; closer matches the same literal run, so a 4-backtick outer
@@ -1304,6 +1328,7 @@ with `emacs-lisp-mode' face properties on the body and a
       ;; Honor `agent-shell-markdown-frozen'.
       (unless (get-text-property (match-beginning 4)
                                  'agent-shell-markdown-frozen)
+        (setq rendered t)
         (let* ((open-start (match-beginning 1))
                (open-end (match-end 1))
                (lang (buffer-substring-no-properties (match-beginning 3)
@@ -1464,10 +1489,11 @@ with `emacs-lisp-mode' face properties on the body and a
                 ;; above.
                 (put-text-property (marker-position body-start) panel-bottom
                                    'agent-shell-markdown-source-block-rendered t))
-              ;; Move point past the body so the outer `re-search-forward'
-              ;; loop doesn't backtrack into body content (e.g. shorter
-              ;; inner fences inside a wider outer fence).
-              (goto-char (marker-position body-end)))))))))
+               ;; Move point past the body so the outer `re-search-forward'
+               ;; loop doesn't backtrack into body content (e.g. shorter
+               ;; inner fences inside a wider outer fence).
+               (goto-char (marker-position body-end)))))))
+     rendered))
 
 (defconst agent-shell-markdown--table-line-regexp
   (rx line-start
@@ -1663,8 +1689,11 @@ For example, the buffer:
   - [x] Done
 
 renders as `• Todo' and a checkbox line struck through, each behind
-a two-column base indent."
-  (let ((case-fold-search nil))
+a two-column base indent.
+
+Returns non-nil when at least one list line was rendered this call."
+  (let ((case-fold-search nil)
+        (rendered nil))
     (goto-char (point-min))
     (while (re-search-forward
             agent-shell-markdown--list-item-line-regexp nil t)
@@ -1674,6 +1703,7 @@ a two-column base indent."
                      line-start line-end avoid-ranges)))
         (if avoid
             (goto-char (cdr avoid))
+          (setq rendered t)
           (agent-shell-markdown--render-list-line
            :line-start line-start
            :line-end line-end
@@ -1697,13 +1727,15 @@ a two-column base indent."
                  (looking-at agent-shell-markdown--list-item-last-line-regexp)
                  (not (agent-shell-markdown-in-avoid-range-p
                        (match-beginning 0) (match-end 0) avoid-ranges)))
+        (setq rendered t)
         (agent-shell-markdown--render-list-line
          :line-start (match-beginning 0)
          :line-end (match-end 0)
          :indent-width (- (match-end 1) (match-beginning 1))
          :marker-start (match-beginning 2)
          :marker-end (match-end 2)
-         :content-start (match-end 3))))))
+         :content-start (match-end 3))))
+    rendered))
 
 (defun agent-shell-markdown--blank-line-at-p (pos)
   "Return non-nil when the line holding POS is blank.
@@ -2927,13 +2959,17 @@ blocks whose closing fence hasn't streamed in yet).
 Honours `agent-shell-markdown-prettify-tables'.  Cell content is taken
 directly from the buffer (with text properties preserved from
 the earlier inline passes), so bold/italic/inline-code/link
-rendering inside cells is provided for free."
+rendering inside cells is provided for free.
+
+Returns non-nil when at least one table was rendered this call."
   (when agent-shell-markdown-prettify-tables
     ;; Process tables in reverse so earlier positions stay valid as
     ;; each replacement shifts everything after it.
-    (dolist (table (nreverse (agent-shell-markdown--find-tables
-                              :avoid-ranges avoid-ranges)))
-      (agent-shell-markdown--render-table table))))
+    (let ((tables (agent-shell-markdown--find-tables
+                   :avoid-ranges avoid-ranges)))
+      (dolist (table (nreverse tables))
+        (agent-shell-markdown--render-table table))
+      tables)))
 
 (defun agent-shell-markdown-table-next-cell ()
   "Move point to the start of the next table cell.
