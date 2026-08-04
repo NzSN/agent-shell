@@ -3784,6 +3784,17 @@ fragment (or activity group) is always kept intact."
                                (map-elt header :start)
                              (prop-match-beginning match)))))
           (when (> cut (point-min))
+            ;; Free the deleted fragments' cached range markers so they
+            ;; don't linger in the buffer's marker list.
+            (let ((pos (point-min)))
+              (while (< pos cut)
+                (let ((state (get-text-property pos 'agent-shell-ui-state))
+                      (next (or (next-single-property-change
+                                 pos 'agent-shell-ui-state nil cut)
+                                cut)))
+                  (when state
+                    (agent-shell-ui--release-range-markers state))
+                  (setq pos next))))
             (let ((inhibit-read-only t)
                   (buffer-undo-list t))
               (delete-region (point-min) cut))))))))

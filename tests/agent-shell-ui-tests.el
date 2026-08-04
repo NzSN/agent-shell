@@ -679,6 +679,78 @@ navigatable block, not on the non-navigatable block's own start."
             (should (equal (agent-shell-ui-backward-block) first-start))))
       (kill-buffer buf))))
 
+;;; range markers
+
+(defun agent-shell-ui-tests--searched-ranges (block-start)
+  "Return ranges at BLOCK-START via property searches (the uncached way)."
+  (when-let* ((block-range (agent-shell-ui--block-range :position block-start)))
+    (list (cons :block block-range)
+          (cons :body (agent-shell-ui--nearest-range-matching-property
+                       :property 'agent-shell-ui-section :value 'body
+                       :from (map-elt block-range :start)
+                       :to (map-elt block-range :end)))
+          (cons :label-left (agent-shell-ui--nearest-range-matching-property
+                             :property 'agent-shell-ui-section :value 'label-left
+                             :from (map-elt block-range :start)
+                             :to (map-elt block-range :end)))
+          (cons :label-right (agent-shell-ui--nearest-range-matching-property
+                              :property 'agent-shell-ui-section :value 'label-right
+                              :from (map-elt block-range :start)
+                              :to (map-elt block-range :end))))))
+
+(ert-deftest agent-shell-ui-range-markers-match-searched-ranges-test ()
+  "Cached range markers agree with property searches across updates."
+  (with-temp-buffer
+    (agent-shell-ui-mode 1)
+    (agent-shell-ui-update-fragment
+     (agent-shell-ui-make-fragment-model
+      :namespace-id "ns" :block-id "1"
+      :label-left "Label" :label-right "right" :body "body one")
+     :expanded t :navigation 'always)
+    (let ((start (agent-shell-ui-tests--fragment-start "ns-1")))
+      ;; After creation.
+      (should (equal (agent-shell-ui--fragment-ranges start)
+                     (agent-shell-ui-tests--searched-ranges start)))
+      ;; After a body append.
+      (agent-shell-ui-update-fragment
+       (agent-shell-ui-make-fragment-model
+        :namespace-id "ns" :block-id "1" :body " more")
+       :append t :navigation 'always)
+      (should (equal (agent-shell-ui--fragment-ranges start)
+                     (agent-shell-ui-tests--searched-ranges start)))
+      ;; After a body replace.
+      (agent-shell-ui-update-fragment
+       (agent-shell-ui-make-fragment-model
+        :namespace-id "ns" :block-id "1" :body "replaced body")
+       :navigation 'always)
+      (should (equal (agent-shell-ui--fragment-ranges start)
+                     (agent-shell-ui-tests--searched-ranges start)))
+      ;; After a label replace.
+      (agent-shell-ui-update-fragment
+       (agent-shell-ui-make-fragment-model
+        :namespace-id "ns" :block-id "1" :label-left "New longer label")
+       :navigation 'always)
+      (should (equal (agent-shell-ui--fragment-ranges start)
+                     (agent-shell-ui-tests--searched-ranges start))))))
+
+(ert-deftest agent-shell-ui-range-markers-released-on-delete-test ()
+  "Deleting a fragment points its cached range markers nowhere."
+  (with-temp-buffer
+    (agent-shell-ui-mode 1)
+    (agent-shell-ui-update-fragment
+     (agent-shell-ui-make-fragment-model
+      :namespace-id "ns" :block-id "1"
+      :label-left "Label" :body "body one")
+     :expanded t :navigation 'always)
+    (let* ((start (agent-shell-ui-tests--fragment-start "ns-1"))
+           (state (get-text-property start 'agent-shell-ui-state)))
+      ;; Populate the cache.
+      (agent-shell-ui--fragment-ranges start)
+      (should (map-elt state :range-markers))
+      (agent-shell-ui-delete-fragment :namespace-id "ns" :block-id "1")
+      (dolist (cell (map-elt state :range-markers))
+        (should-not (marker-buffer (cdr cell)))))))
+
 ;;; provide
 
 (provide 'agent-shell-ui-tests)
