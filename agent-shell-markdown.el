@@ -331,6 +331,18 @@ character and re-stamped at the end of the call.  Pass FORCE
 non-nil to drop the watermark and re-render the whole buffer
 (useful after mid-buffer edits, or for tests).
 
+While a fenced block is still open (its closing fence hasn't
+streamed in), the call defers all rendering: the only work is
+scanning the newly-streamed tail for the closing fence line
+\(tracked via the `agent-shell-markdown-open-fence' text property
+on the first character).  An open block's content is raw code that
+no pass can style — `agent-shell-markdown--style-source-blocks'
+leaves it alone — so re-scanning it on every chunk is pure waste:
+deferring makes streaming an N-line block over K chunks cost
+O(N + K) instead of O(N × K).  The chunk carrying the closer gets
+the full render, which also covers any prose that followed the
+fence in the same chunk.
+
 RENDER-IMAGES, when non-nil (the default), replaces `![alt](url)'
 markup with displayed images where the URL resolves to an image
 file; nil leaves the markup as-is.  IMAGE-CACHE-DIRECTORY is where
@@ -345,8 +357,31 @@ body un-fontified."
     (when force
       (with-silent-modifications
         (remove-text-properties (point-min) (point-max)
-                                '(agent-shell-markdown-watermark nil))))
-    (let ((watermark (agent-shell-markdown--watermark-start))
+                                '(agent-shell-markdown-watermark nil
+                                  agent-shell-markdown-open-fence nil))))
+    (let ((open-fence (and (not force)
+                           (> (point-max) (point-min))
+                           (get-text-property (point-min)
+                                              'agent-shell-markdown-open-fence))))
+      (if (and (consp open-fence)
+               (integerp (car open-fence))
+               (integerp (cdr open-fence))
+               (<= (cdr open-fence) (point-max))
+               (not (agent-shell-markdown--fence-closer-since-p
+                     (car open-fence) (cdr open-fence))))
+          ;; Fenced block still open: raw code until the closer streams
+          ;; in, nothing for any pass to do.  Defer the full render to
+          ;; the chunk carrying the closing fence.
+          (with-silent-modifications
+            (put-text-property (point-min) (1+ (point-min))
+                               'agent-shell-markdown-open-fence
+                               (cons (car open-fence) (point-max)))
+            (put-text-property (cdr open-fence) (point-max)
+                               'yank-handler
+                               (list (lambda (s)
+                                       (insert (substring-no-properties s)))))
+            (put-text-property (cdr open-fence) (point-max) 'fontified t))
+      (let ((watermark (agent-shell-markdown--watermark-start))
           (external-results)
           (context)
           (source-blocks)
@@ -458,7 +493,7 @@ body un-fontified."
       (agent-shell-markdown--update-watermark
        :source-blocks source-blocks
        :external-candidates (seq-keep (lambda (result) (map-elt result :watermark))
-                                      external-results)))))
+                                      external-results)))))))
 
 (defun agent-shell-markdown--source-block-ranges (source-blocks)
   "Project SOURCE-BLOCKS to sorted (START . END) marker ranges.
@@ -3369,6 +3404,25 @@ point, a table from there can no longer accumulate."
            (t (setq continue nil))))
         (or rendered-table-start pending-table-start)))))
 
+(defun agent-shell-markdown--fence-closer-since-p (open-count position)
+  "Return non-nil when a fence line of >= OPEN-COUNT backticks follows POSITION.
+
+Scans from the beginning of the line containing POSITION, so a
+closing fence split across two streamed chunks (line begun by the
+first, completed by the second) is still seen.  Mirrors the fence
+pairing of `agent-shell-markdown--source-blocks': any fence line
+whose backtick run is at least OPEN-COUNT long closes the open block."
+  (save-excursion
+    (goto-char (max (point-min) position))
+    (beginning-of-line)
+    (catch 'closer
+      (while (re-search-forward (rx bol (zero-or-more whitespace)
+                                    (group (>= 3 "`")))
+                                nil t)
+        (when (>= (- (match-end 1) (match-beginning 1)) open-count)
+          (throw 'closer t)))
+      nil)))
+
 (cl-defun agent-shell-markdown--update-watermark (&key source-blocks external-candidates)
   "Stamp the safe-frontier on the first character as a text property.
 
@@ -3397,12 +3451,22 @@ markup as more chunks stream in.  Single-line patterns (bold,
 italic, strike, header, link, image, inline code, divider) cannot
 span a newline, so backing off to start-of-last-line covers their
 split-across-chunks case.  Open inline backticks already extend
-only to end-of-line, so they're naturally within that zone."
+only to end-of-line, so they're naturally within that zone.
+
+When a fenced block is still open, also record its backtick count
+and the current `point-max' on the `agent-shell-markdown-open-fence'
+property (and clear it once no open block remains), so
+`agent-shell-markdown-replace-markup' can defer rendering until the
+closing fence streams in."
   (when (> (point-max) (point-min))
-    (let* ((open-fence-start
+    (let* ((open-fence-block
             (when-let* ((last-block (car (last source-blocks)))
+                        ((not (map-elt last-block :complete)))
                         ((= (map-nested-elt last-block '(:block :end)) (point-max))))
-              (marker-position (map-nested-elt last-block '(:block :start)))))
+              last-block))
+           (open-fence-start
+            (when open-fence-block
+              (marker-position (map-nested-elt open-fence-block '(:block :start)))))
            (extending-table-start
             (agent-shell-markdown--extending-table-start))
            (last-line-start
@@ -3415,7 +3479,18 @@ only to end-of-line, so they're naturally within that zone."
                                               external-candidates)))))
       (with-silent-modifications
         (put-text-property (point-min) (1+ (point-min))
-                           'agent-shell-markdown-watermark frontier)))))
+                           'agent-shell-markdown-watermark frontier)
+        (if open-fence-block
+            ;; Record the open fence (backtick count . scan position) so
+            ;; the next streamed chunk can defer all rendering until the
+            ;; closing fence arrives (see
+            ;; `agent-shell-markdown-replace-markup').
+            (put-text-property (point-min) (1+ (point-min))
+                               'agent-shell-markdown-open-fence
+                               (cons (map-elt open-fence-block :fence-count)
+                                     (point-max)))
+          (remove-text-properties (point-min) (1+ (point-min))
+                                  '(agent-shell-markdown-open-fence nil)))))))
 
 (defun agent-shell-markdown--make-markers (ranges)
   "Convert each (start . end) in RANGES to (start-marker . end-marker)."
@@ -3529,7 +3604,8 @@ returns one descriptor with :language \"math\", :body
                           (cons :body (if (string-suffix-p "\n" raw)
                                           (substring raw 0 -1)
                                         raw))
-                          (cons :complete t))
+                          (cons :complete t)
+                          (cons :fence-count open-count))
                     source-blocks))
             (setq open-start nil open-count nil
                   open-language nil body-start nil))
@@ -3546,7 +3622,8 @@ returns one descriptor with :language \"math\", :body
                                   :start (copy-marker open-start)
                                   :end (copy-marker (point-max))))
                     (cons :body nil)
-                    (cons :complete nil))
+                    (cons :complete nil)
+                    (cons :fence-count open-count))
               source-blocks)))
     (nreverse source-blocks)))
 
