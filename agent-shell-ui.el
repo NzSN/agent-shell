@@ -194,15 +194,22 @@ O(accumulated-body).  Label-only updates leave the body untouched."
                     ;; would point at the wrong chars (e.g. handing
                     ;; `replace-body' a stale range corrupts the body
                     ;; boundary and leaks its content past the collapse).
-                    (let* ((current-block-end
-                            (or (map-elt (agent-shell-ui--block-range :position block-start)
+                    ;; The label replacements update the cached range
+                    ;; markers, so these reads stay O(1).
+                    (let* ((range-markers (agent-shell-ui--fragment-range-markers
+                                           state block-start))
+                           (current-block-end
+                            (or (agent-shell-ui--range-marker-position range-markers :block-end)
+                                (map-elt (agent-shell-ui--block-range :position block-start)
                                          :end)
                                 (prop-match-end match)))
                            (existing-body-range
-                            (agent-shell-ui--nearest-range-matching-property
-                             :property 'agent-shell-ui-section :value 'body
-                             :from block-start
-                             :to current-block-end)))
+                            (or (agent-shell-ui--make-marker-range
+                                 range-markers :body-start :body-end)
+                                (agent-shell-ui--nearest-range-matching-property
+                                 :property 'agent-shell-ui-section :value 'body
+                                 :from block-start
+                                 :to current-block-end))))
                       (cond
                        ;; Append to existing body — preserves rendered content.
                        ((and append existing-body-range)
@@ -217,32 +224,38 @@ O(accumulated-body).  Label-only updates leave the body untouched."
                        ;; indicator transitions from placeholder to triangle
                        ;; and the labels↔body separator is inserted.  Labels
                        ;; are recovered from the buffer (no cache).
-                       (t
-                        (let* ((existing-labels
-                                (agent-shell-ui--read-fragment-labels
-                                 block-start current-block-end))
-                               (final-model
-                                (list (cons :namespace-id namespace-id)
-                                      (cons :block-id (map-elt model :block-id))
-                                      (cons :label-left
-                                            (or new-label-left
-                                                (map-elt existing-labels :label-left)))
-                                      (cons :label-right
-                                            (or new-label-right
-                                                (map-elt existing-labels :label-right)))
-                                      (cons :body new-body)
-                                      ;; Preserve group membership + indent so
-                                      ;; the regenerated member stays nested.
-                                      (cons :group-qualified-id
-                                            (map-elt model :group-qualified-id))
-                                      (cons :group-indent
-                                            (map-elt model :group-indent)))))
-                          (delete-region block-start current-block-end)
-                          (goto-char block-start)
-                          (agent-shell-ui--insert-fragment
-                           final-model qualified-id (not collapsed) navigation))))))
+                        (t
+                         (let* ((existing-labels
+                                 (agent-shell-ui--read-fragment-labels
+                                  block-start current-block-end))
+                                (final-model
+                                 (list (cons :namespace-id namespace-id)
+                                       (cons :block-id (map-elt model :block-id))
+                                       (cons :label-left
+                                             (or new-label-left
+                                                 (map-elt existing-labels :label-left)))
+                                       (cons :label-right
+                                             (or new-label-right
+                                                 (map-elt existing-labels :label-right)))
+                                       (cons :body new-body)
+                                       ;; Preserve group membership + indent so
+                                       ;; the regenerated member stays nested.
+                                       (cons :group-qualified-id
+                                             (map-elt model :group-qualified-id))
+                                       (cons :group-indent
+                                             (map-elt model :group-indent)))))
+                           ;; The regenerate swaps in a fresh state (fresh
+                           ;; markers); release the old ones first.
+                           (agent-shell-ui--release-range-markers state)
+                           (delete-region block-start current-block-end)
+                           (goto-char block-start)
+                           (agent-shell-ui--insert-fragment
+                            final-model qualified-id (not collapsed) navigation))))))
                   (setq padding-end
-                        (or (when-let* ((block-range
+                        (or (agent-shell-ui--range-marker-position
+                             (agent-shell-ui--fragment-range-markers state block-start)
+                             :block-end)
+                            (when-let* ((block-range
                                          (agent-shell-ui--block-range :position block-start)))
                               (map-elt block-range :end))
                             (point)))))
@@ -284,20 +297,27 @@ O(accumulated-body).  Label-only updates leave the body untouched."
               (agent-shell-ui--set-group-collapsed group-qid t))
             (when on-post-process
               (funcall on-post-process))
-            (when-let* ((block-range (agent-shell-ui--block-range :position block-start)))
-              (list (cons :block block-range)
-                    (cons :body (agent-shell-ui--nearest-range-matching-property
-                                 :property 'agent-shell-ui-section :value 'body
-                                 :from (map-elt block-range :start)
-                                 :to (map-elt block-range :end)))
-                    (cons :label-left (agent-shell-ui--nearest-range-matching-property
-                                       :property 'agent-shell-ui-section :value 'label-left
-                                       :from (map-elt block-range :start)
-                                       :to (map-elt block-range :end)))
-                    (cons :label-right (agent-shell-ui--nearest-range-matching-property
-                                        :property 'agent-shell-ui-section :value 'label-right
-                                        :from (map-elt block-range :start)
-                                        :to (map-elt block-range :end)))
+            (when-let* ((ranges (or (agent-shell-ui--fragment-ranges block-start)
+                                    (when-let* ((block-range (agent-shell-ui--block-range
+                                                              :position block-start)))
+                                      (list
+                                       (cons :block block-range)
+                                       (cons :body (agent-shell-ui--nearest-range-matching-property
+                                                    :property 'agent-shell-ui-section :value 'body
+                                                    :from (map-elt block-range :start)
+                                                    :to (map-elt block-range :end)))
+                                       (cons :label-left (agent-shell-ui--nearest-range-matching-property
+                                                          :property 'agent-shell-ui-section :value 'label-left
+                                                          :from (map-elt block-range :start)
+                                                          :to (map-elt block-range :end)))
+                                       (cons :label-right (agent-shell-ui--nearest-range-matching-property
+                                                           :property 'agent-shell-ui-section :value 'label-right
+                                                           :from (map-elt block-range :start)
+                                                           :to (map-elt block-range :end))))))))
+              (list (cons :block (map-elt ranges :block))
+                    (cons :body (map-elt ranges :body))
+                    (cons :label-left (map-elt ranges :label-left))
+                    (cons :label-right (map-elt ranges :label-right))
                     (cons :padding (when (and padding-start padding-end)
                                      (list (cons :start padding-start)
                                            (cons :end padding-end))))
@@ -415,7 +435,15 @@ state, because label-less fragments don't follow `state :collapsed'
           (agent-shell-ui--apply-body-section-properties
            insert-start insert-end qualified-id state body-invisible)
           (agent-shell-ui--apply-trailing-whitespace-invisible
-           body-start insert-end))))))
+           body-start insert-end)
+          ;; Keep the cached range markers current: the body grew, and
+          ;; the block's end grows with it when the body is last.
+          (when-let* ((markers (map-elt state :range-markers))
+                      (body-end-marker (map-elt markers :body-end)))
+            (set-marker body-end-marker insert-end)
+            (when-let* ((block-end-marker (map-elt markers :block-end))
+                        ((= (marker-position block-end-marker) body-end)))
+              (set-marker block-end-marker insert-end))))))))
 
 (defun agent-shell-ui--replace-body (body-range new-body qualified-id _collapsed)
   "Replace the body region described by BODY-RANGE with NEW-BODY.
@@ -431,7 +459,12 @@ matches the body's current visibility, not caller-supplied state."
          (body-end (map-elt body-range :end))
          (state (get-text-property (max body-start (1- body-end))
                                    'agent-shell-ui-state))
-         (body-invisible (agent-shell-ui--body-invisible-p body-start body-end)))
+         (body-invisible (agent-shell-ui--body-invisible-p body-start body-end))
+         (markers (map-elt state :range-markers))
+         (block-extends-with-body
+          (and markers
+               (map-elt markers :block-end)
+               (= (marker-position (map-elt markers :block-end)) body-end))))
     (delete-region body-start body-end)
     (goto-char body-start)
     (when (and (stringp new-body) (not (string-empty-p new-body)))
@@ -448,7 +481,12 @@ matches the body's current visibility, not caller-supplied state."
             (agent-shell-ui--apply-body-section-properties
              insert-start insert-end qualified-id state body-invisible)
             (agent-shell-ui--apply-trailing-whitespace-invisible
-             insert-start insert-end)))))))
+             insert-start insert-end)
+            ;; Keep the cached range markers current after the swap.
+            (when-let* ((body-end-marker (map-elt markers :body-end)))
+              (set-marker body-end-marker insert-end))
+            (when block-extends-with-body
+              (set-marker (map-elt markers :block-end) insert-end))))))))
 
 (defun agent-shell-ui--replace-label (qualified-id section new-text)
   "Replace the SECTION region of fragment QUALIFIED-ID with NEW-TEXT.
@@ -488,7 +526,12 @@ are preserved across label updates."
                                (buffer-substring-no-properties (car region) (cdr region))))))
       (let* ((region-start (car region))
              (region-end (cdr region))
-             (state (get-text-property region-start 'agent-shell-ui-state)))
+             (state (get-text-property region-start 'agent-shell-ui-state))
+             (markers (map-elt state :range-markers))
+             (block-extends-with-section
+              (and markers
+                   (map-elt markers :block-end)
+                   (= (marker-position (map-elt markers :block-end)) region-end))))
         (delete-region region-start region-end)
         (goto-char region-start)
         (let ((insert-start (point)))
@@ -499,15 +542,22 @@ are preserved across label updates."
                      (agent-shell-ui--toggle-fragment-at-point))
                    (lambda ()
                      (message "Press RET to toggle"))))
-          (let ((insert-end (point)))
-            (add-text-properties insert-start insert-end
-                                 `(agent-shell-ui-section ,section
-                                                          help-echo ,(agent-shell-ui--fragment-help-echo qualified-id)
-                                                          read-only t
-                                                          front-sticky (read-only)))
-            (when state
-              (put-text-property insert-start insert-end
-                                 'agent-shell-ui-state state))))))))
+           (let ((insert-end (point)))
+             (add-text-properties insert-start insert-end
+                                  `(agent-shell-ui-section ,section
+                                                           help-echo ,(agent-shell-ui--fragment-help-echo qualified-id)
+                                                           read-only t
+                                                           front-sticky (read-only)))
+             (when state
+               (put-text-property insert-start insert-end
+                                  'agent-shell-ui-state state))
+             ;; Keep the cached range markers current: the label's end
+             ;; moved, and the block's end moves with the last section.
+              (when-let* ((end-marker (map-elt markers
+                                               (intern (format ":%s-end" section)))))
+                (set-marker end-marker insert-end)
+                (when block-extends-with-section
+                  (set-marker (map-elt markers :block-end) insert-end)))))))))
 
 
 (cl-defun agent-shell-ui-delete-fragment (&key namespace-id block-id no-undo)
@@ -528,6 +578,8 @@ When NO-UNDO is non-nil, disable undo recording for this operation."
       (when match
         (let ((block-start (prop-match-beginning match))
               (block-end (prop-match-end match)))
+          (agent-shell-ui--release-range-markers
+           (get-text-property block-start 'agent-shell-ui-state))
           ;; Remove trailing vertical space that's part of the block, but
           ;; stop at the next fragment's content.  The next fragment's
           ;; leading indicator (e.g. the "  " collapse placeholder) is
@@ -555,6 +607,91 @@ In the form:
      :value qualified-id
      :predicate (lambda (qualified-id property)
                   (equal (map-elt property :qualified-id) qualified-id)))))
+
+(defun agent-shell-ui--compute-range-markers (block-start)
+  "Compute fragment range markers at BLOCK-START via property searches.
+
+Returns an alist ((:block-start . MARKER) (:block-end . MARKER)
+ (:body-start . MARKER) (:body-end . MARKER)
+ (:label-left-start . MARKER) (:label-left-end . MARKER)
+ (:label-right-start . MARKER) (:label-right-end . MARKER))
+holding entries only for sections present.  This does the
+interval-walking searches once; results are cached on the fragment
+state (see `agent-shell-ui--fragment-range-markers') so per-chunk
+updates don't re-walk the block's property intervals."
+  (save-mark-and-excursion
+    (goto-char block-start)
+    (let* ((block-end (or (map-elt (agent-shell-ui--block-range :position block-start)
+                                   :end)
+                          block-start))
+           (markers (list (cons :block-start (copy-marker block-start t))
+                          (cons :block-end (copy-marker block-end)))))
+      (dolist (section '(body label-left label-right))
+        (when-let* ((range (agent-shell-ui--nearest-range-matching-property
+                            :property 'agent-shell-ui-section :value section
+                            :from block-start :to block-end)))
+          (push (cons (intern (format ":%s-start" section))
+                      (copy-marker (map-elt range :start)))
+                markers)
+          (push (cons (intern (format ":%s-end" section))
+                      (copy-marker (map-elt range :end)))
+                markers)))
+      (nreverse markers))))
+
+(defun agent-shell-ui--fragment-range-markers (state block-start)
+  "Return STATE's cached range markers, computing and caching when absent.
+
+The fragment's block/body/label ranges as an alist of markers (see
+`agent-shell-ui--compute-range-markers').  Cached on STATE's
+:range-markers because recomputing the ranges per streamed chunk
+walks the block's whole property-interval tree — O(intervals) per
+chunk, O(chunks x intervals) per message.  The mutation paths
+\(`agent-shell-ui--append-body', `agent-shell-ui--replace-body',
+`agent-shell-ui--replace-label') keep the end markers current, so
+reads are O(1)."
+  (if (assq :range-markers state)
+      (or (map-elt state :range-markers)
+          (setf (map-elt state :range-markers)
+                (agent-shell-ui--compute-range-markers block-start)))
+    ;; A fragment from before marker caching existed: compute without
+    ;; caching (the state alist can't grow new keys in place).
+    (agent-shell-ui--compute-range-markers block-start)))
+
+(defun agent-shell-ui--range-marker-position (markers name)
+  "Return the position of NAME in range MARKERS alist, or nil when unset."
+  (when-let* ((marker (map-elt markers name))
+              ((marker-buffer marker)))
+    (marker-position marker)))
+
+(defun agent-shell-ui--make-marker-range (markers start-name end-name)
+  "Return ((:start . S) (:end . E)) for START-NAME/END-NAME in MARKERS, or nil."
+  (when-let* ((start (agent-shell-ui--range-marker-position markers start-name))
+              (end (agent-shell-ui--range-marker-position markers end-name)))
+    (list (cons :start start) (cons :end end))))
+
+(defun agent-shell-ui--fragment-ranges (block-start)
+  "Return fragment ranges at BLOCK-START from the state's cached markers.
+
+An alist with :block, :body, :label-left and :label-right keys,
+each ((:start . S) (:end . E)) or nil.  This is the O(1) equivalent
+of the per-chunk property searches; see
+`agent-shell-ui--fragment-range-markers'."
+  (when-let* ((state (get-text-property block-start 'agent-shell-ui-state))
+              (markers (agent-shell-ui--fragment-range-markers state block-start))
+              (start (agent-shell-ui--range-marker-position markers :block-start))
+              (end (agent-shell-ui--range-marker-position markers :block-end)))
+    (list (cons :block (list (cons :start start) (cons :end end)))
+          (cons :body (agent-shell-ui--make-marker-range markers :body-start :body-end))
+          (cons :label-left (agent-shell-ui--make-marker-range markers :label-left-start :label-left-end))
+          (cons :label-right (agent-shell-ui--make-marker-range markers :label-right-start :label-right-end)))))
+
+(defun agent-shell-ui--release-range-markers (state)
+  "Release STATE's cached range markers (point them nowhere).
+
+Called when a fragment is deleted, so the markers don't linger in
+the buffer's marker list."
+  (dolist (cell (map-elt state :range-markers))
+    (set-marker (cdr cell) nil)))
 
 (cl-defun agent-shell-ui--nearest-range-matching-property (&key property value (predicate t) from to)
   "Return nearest range where PREDICATE is non-nil for PROPERTY and VALUE."
@@ -878,6 +1015,7 @@ indents a member's header line under its group header."
                             (cons :group-id group-qualified-id)
                             (cons :group-indent group-indent)
                             (cons :collapsed (not expanded))
+                            (cons :range-markers nil)
                             (cons :navigatable (cond
                                                 ((eq navigation 'never) nil)
                                                 ((eq navigation 'always) t)
