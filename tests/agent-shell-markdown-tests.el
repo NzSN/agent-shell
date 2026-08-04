@@ -2717,6 +2717,112 @@ for a fully-selected buffer."
     (search-forward "⧉")
     (should-not (agent-shell-markdown-source-block-at-point (1- (point))))))
 
+;;; open-fence deferred rendering
+
+(ert-deftest agent-shell-markdown-open-fence-defers-render-until-closer-test ()
+  ;; While a fence is open, its body stays raw (no `agent-shell-markdown-frozen')
+  ;; and the `agent-shell-markdown-open-fence' state is recorded on the first
+  ;; char.  The chunk carrying the closing fence gets the full render and the
+  ;; state is cleared.
+  (with-temp-buffer
+    (insert "before\n\n```elisp\n(message \"hi\")\n")
+    (agent-shell-markdown-replace-markup)
+    (should (get-text-property (point-min) 'agent-shell-markdown-open-fence))
+    (should-not (text-property-any (point-min) (point-max)
+                                   'agent-shell-markdown-frozen t))
+    (goto-char (point-max))
+    (insert "(message \"more\")\n```\n\nafter **bold**\n")
+    (agent-shell-markdown-replace-markup)
+    (should-not (get-text-property (point-min) 'agent-shell-markdown-open-fence))
+    (should (text-property-any (point-min) (point-max)
+                               'agent-shell-markdown-frozen t))
+    ;; Prose trailing the closer in the same chunk renders in the same call.
+    (goto-char (point-min))
+    (search-forward "bold")
+    (should (get-text-property (match-beginning 0) 'face))))
+
+(ert-deftest agent-shell-markdown-open-fence-skips-rescans-test ()
+  ;; Chunks streamed into an open fence must not re-scan the accumulated
+  ;; block: `agent-shell-markdown--source-blocks' runs only when the closing
+  ;; fence arrives, not on every chunk.
+  (let ((scan-count 0))
+    (with-temp-buffer
+      (insert "```elisp\n")
+      (agent-shell-markdown-replace-markup)
+      (let ((advice (lambda (orig &rest args)
+                      (setq scan-count (1+ scan-count))
+                      (apply orig args))))
+        (advice-add 'agent-shell-markdown--source-blocks :around advice)
+        (unwind-protect
+            (progn
+              (dotimes (i 5)
+                (goto-char (point-max))
+                (insert (format "(line %d)\n" i))
+                (agent-shell-markdown-replace-markup))
+              (should (= scan-count 0))
+              (goto-char (point-max))
+              (insert "```\n")
+              (agent-shell-markdown-replace-markup)
+              (should (> scan-count 0)))
+          (advice-remove 'agent-shell-markdown--source-blocks advice))))))
+
+(ert-deftest agent-shell-markdown-open-fence-split-closer-test ()
+  ;; A closing fence split across chunks (line begun by one, completed by
+  ;; the next) is still detected: the partial fence line keeps the deferral
+  ;; active, the completing chunk triggers the render.
+  (with-temp-buffer
+    (insert "```\ncode\n")
+    (agent-shell-markdown-replace-markup)
+    (goto-char (point-max))
+    (insert "`")
+    (agent-shell-markdown-replace-markup)
+    (should (get-text-property (point-min) 'agent-shell-markdown-open-fence))
+    (goto-char (point-max))
+    (insert "``\n")
+    (agent-shell-markdown-replace-markup)
+    (should-not (get-text-property (point-min) 'agent-shell-markdown-open-fence))
+    (should (text-property-any (point-min) (point-max)
+                               'agent-shell-markdown-frozen t))))
+
+(ert-deftest agent-shell-markdown-open-fence-matches-one-shot-render-test ()
+  ;; Chunked streaming with a fenced block in the middle converges to the
+  ;; same text and faces as a single forced render of the full input.
+  ;; The closing fence and the trailing prose share a chunk: a block
+  ;; completing at end-of-buffer gets an extra pad line the one-shot
+  ;; render doesn't add (pre-existing streaming behavior, unrelated to
+  ;; the deferral).
+  (let ((text "intro **bold**\n\n```elisp\n(message \"hi\")\n(+ 1 2)\n```\n\noutro _italic_\n")
+        (chunks (list "intro **bold**\n\n```elisp\n(message \"hi\")\n(+ 1"
+                      " 2)\n```\n\noutro _italic_\n")))
+    (let ((chunked (with-temp-buffer
+                     (dolist (chunk chunks)
+                       (goto-char (point-max))
+                       (insert chunk)
+                       (agent-shell-markdown-replace-markup))
+                     (buffer-string)))
+          (one-shot (with-temp-buffer
+                      (insert text)
+                      (agent-shell-markdown-replace-markup :force t)
+                      (buffer-string))))
+      (should (equal (substring-no-properties chunked)
+                     (substring-no-properties one-shot)))
+      (should (equal (agent-shell-markdown--deconstruct chunked)
+                     (agent-shell-markdown--deconstruct one-shot))))))
+
+(ert-deftest agent-shell-markdown-force-clears-open-fence-state-test ()
+  ;; A forced render drops any recorded open-fence state along with the
+  ;; watermark, so a stale value can't defer rendering after mid-buffer edits.
+  (with-temp-buffer
+    (insert "```elisp\n(message \"hi\")\n")
+    (agent-shell-markdown-replace-markup)
+    (should (get-text-property (point-min) 'agent-shell-markdown-open-fence))
+    (agent-shell-markdown-replace-markup :force t)
+    (should (get-text-property (point-min) 'agent-shell-markdown-open-fence))
+    (goto-char (point-max))
+    (insert "```\n")
+    (agent-shell-markdown-replace-markup :force t)
+    (should-not (get-text-property (point-min) 'agent-shell-markdown-open-fence))))
+
 (provide 'agent-shell-markdown-tests)
 
 ;;; agent-shell-markdown-tests.el ends here

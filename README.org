@@ -895,6 +895,7 @@ always go to Evil modes if you need to with ~C-z~).
 | agent-shell-auggie-acp-command                | Command and parameters for the Auggie client.                                   |
 | agent-shell-auggie-authentication             | Configuration for Auggie authentication.                                        |
 | agent-shell-auggie-environment                | Environment variables for the Auggie client.                                    |
+| agent-shell-buffer-maximum-size               | Maximum number of lines to keep in the shell buffer.                            |
 | agent-shell-buffer-name-format                | Format to use when generating agent shell buffer names.                         |
 | agent-shell-busy-indicator-frames             | Frames for the busy indicator animation.                                        |
 | agent-shell-clipboard-image-handlers          | Handlers for saving clipboard images to a file.                                 |
