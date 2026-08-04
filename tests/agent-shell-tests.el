@@ -5027,5 +5027,104 @@ the global hook value must stay quiet."
     (should (equal 0 global-calls))
     (should (equal 0 local-calls))))
 
+;;; buffer truncation
+
+(defun agent-shell-tests--fragment-present-p (qualified-id)
+  "Return non-nil when a fragment with QUALIFIED-ID is in current buffer."
+  (save-excursion
+    (goto-char (point-min))
+    (and (text-property-search-forward
+          'agent-shell-ui-state nil
+          (lambda (_value state)
+            (equal (map-elt state :qualified-id) qualified-id)))
+         t)))
+
+(defun agent-shell-tests--insert-fragments (ids)
+  "Insert one fragment per id in IDS into current buffer."
+  (dolist (id ids)
+    (agent-shell-ui-update-fragment
+     (agent-shell-ui-make-fragment-model
+      :namespace-id "ns" :block-id id :label-left id :body (format "body %s" id))
+     :navigation 'always)))
+
+(defun agent-shell-tests--insert-group-members (ids)
+  "Insert fragments IDS as members of one activity group in current buffer."
+  (dolist (id ids)
+    (agent-shell-ui-update-fragment
+     (agent-shell-ui-make-fragment-model
+      :namespace-id "ns" :block-id id :group-id "grp" :group-label "Tools"
+      :label-left "run" :body (format "body %s" id))
+     :navigation 'always)))
+
+(ert-deftest agent-shell-truncate-buffer-nil-disables-truncation-test ()
+  "A nil `agent-shell-buffer-maximum-size' never truncates."
+  (with-temp-buffer
+    (agent-shell-ui-mode 1)
+    (agent-shell-tests--insert-fragments '("1" "2" "3"))
+    (let ((agent-shell-buffer-maximum-size nil)
+          (before (buffer-string)))
+      (agent-shell--truncate-buffer)
+      (should (equal before (buffer-string))))))
+
+(ert-deftest agent-shell-truncate-buffer-within-limit-keeps-content-test ()
+  "Content within `agent-shell-buffer-maximum-size' lines is kept."
+  (with-temp-buffer
+    (agent-shell-ui-mode 1)
+    (agent-shell-tests--insert-fragments '("1" "2" "3"))
+    (let ((agent-shell-buffer-maximum-size 1000)
+          (before (buffer-string)))
+      (agent-shell--truncate-buffer)
+      (should (equal before (buffer-string))))))
+
+(ert-deftest agent-shell-truncate-buffer-removes-oldest-fragments-test ()
+  "Oldest fragments are removed once over the limit.
+Remaining fragments stay whole and the newest fragment is kept, even
+when it alone exceeds `agent-shell-buffer-maximum-size'."
+  (with-temp-buffer
+    (agent-shell-ui-mode 1)
+    (agent-shell-tests--insert-fragments '("1" "2" "3" "4" "5"))
+    (let ((agent-shell-buffer-maximum-size 3)
+          (before-lines (count-lines (point-min) (point-max))))
+      (agent-shell--truncate-buffer)
+      (should (< (count-lines (point-min) (point-max)) before-lines))
+      (should-not (agent-shell-tests--fragment-present-p "ns-1"))
+      (should (agent-shell-tests--fragment-present-p "ns-5"))
+      ;; Remaining fragments are whole: the first state region starts a block.
+      (goto-char (point-min))
+      (let ((match (text-property-search-forward
+                    'agent-shell-ui-state nil (lambda (_value _state) t))))
+        (should match)
+        (should (= (prop-match-beginning match)
+                   (map-elt (agent-shell-ui--block-range
+                             :position (prop-match-beginning match))
+                            :start)))))))
+
+(ert-deftest agent-shell-truncate-buffer-keeps-newest-group-intact-test ()
+  "Truncation never splits the newest activity group."
+  (with-temp-buffer
+    (agent-shell-ui-mode 1)
+    (agent-shell-tests--insert-fragments '("old"))
+    (agent-shell-tests--insert-group-members '("g1" "g2" "g3"))
+    (let ((agent-shell-buffer-maximum-size 3))
+      (agent-shell--truncate-buffer)
+      (should-not (agent-shell-tests--fragment-present-p "ns-old"))
+      (should (agent-shell-tests--fragment-present-p "ns-grp"))
+      (should (agent-shell-tests--fragment-present-p "ns-g1"))
+      (should (agent-shell-tests--fragment-present-p "ns-g2"))
+      (should (agent-shell-tests--fragment-present-p "ns-g3")))))
+
+(ert-deftest agent-shell-truncate-buffer-removes-old-group-whole-test ()
+  "A group fully above the cut is removed whole (header and members)."
+  (with-temp-buffer
+    (agent-shell-ui-mode 1)
+    (agent-shell-tests--insert-group-members '("g1" "g2"))
+    (agent-shell-tests--insert-fragments '("new1" "new2"))
+    (let ((agent-shell-buffer-maximum-size 4))
+      (agent-shell--truncate-buffer)
+      (should-not (agent-shell-tests--fragment-present-p "ns-grp"))
+      (should-not (agent-shell-tests--fragment-present-p "ns-g1"))
+      (should-not (agent-shell-tests--fragment-present-p "ns-g2"))
+      (should (agent-shell-tests--fragment-present-p "ns-new2")))))
+
 (provide 'agent-shell-tests)
 ;;; agent-shell-tests.el ends here

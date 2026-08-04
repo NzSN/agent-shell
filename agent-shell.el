@@ -447,6 +447,21 @@ Default is 100KB (102400 bytes)."
   :type 'integer
   :group 'agent-shell)
 
+(defcustom agent-shell-buffer-maximum-size 10000
+  "Maximum number of lines to keep in the shell buffer.
+
+When the buffer exceeds this size after a completed turn, the oldest
+content is deleted at fragment boundaries (blocks are removed whole,
+never split).  Set to nil to disable truncation and let the buffer
+grow unboundedly.
+
+This mirrors `comint-buffer-maximum-size' for `comint-mode' buffers.
+Truncated content remains available in the transcript file (see
+`agent-shell-open-transcript')."
+  :type '(choice (integer :tag "Maximum lines")
+                 (const :tag "No truncation" nil))
+  :group 'agent-shell)
+
 (defcustom agent-shell-header-style (if (display-graphic-p) 'graphical 'text)
   "Style for agent shell buffer headers.
 
@@ -3724,6 +3739,55 @@ DIFFS is a list of diff infos as returned by
 `agent-shell--make-diff-infos'."
   (agent-shell--format-line-stats (agent-shell--diffs-line-stats diffs)))
 
+(defun agent-shell--truncate-buffer ()
+  "Delete oldest fragments when buffer exceeds `agent-shell-buffer-maximum-size'.
+
+The cut point is computed `agent-shell-buffer-maximum-size' lines from
+the end of the buffer and adjusted so fragments are removed whole: a
+fragment straddling the cut is deleted entirely, along with the rest
+of its activity group when grouped, so blocks and their
+`agent-shell-ui-state' text properties are never split.  The newest
+fragment (or activity group) is always kept intact."
+  (when (and agent-shell-buffer-maximum-size
+             (> agent-shell-buffer-maximum-size 0))
+    (save-restriction
+      (widen)
+      (save-mark-and-excursion
+        (goto-char (point-max))
+        (forward-line (- agent-shell-buffer-maximum-size))
+        (beginning-of-line)
+        (let ((cut (min (point)
+                        (if (bound-and-true-p comint-last-prompt)
+                            (marker-position (car comint-last-prompt))
+                          (point-max)))))
+          (when-let* ((state (and (> cut (point-min))
+                                  (get-text-property cut 'agent-shell-ui-state)))
+                      (block-range (agent-shell-ui--block-range :position cut))
+                      ((> cut (map-elt block-range :start))))
+            (setq cut (map-elt block-range :end))
+            (when-let* ((group-id (or (map-elt state :group-id)
+                                      (and (eq (map-elt state :kind) 'group)
+                                           (map-elt state :qualified-id)))))
+              (setq cut (if-let* ((children (agent-shell-ui--group-children
+                                             :group-qualified-id group-id)))
+                            (map-elt (car (last children)) :end)
+                          (map-elt block-range :end)))))
+          ;; Never delete into the newest fragment or activity group.
+          (goto-char (point-max))
+          (when-let* ((match (text-property-search-backward
+                              'agent-shell-ui-state nil (lambda (_value _state) t) t))
+                      (state (get-text-property (prop-match-beginning match)
+                                                'agent-shell-ui-state)))
+            (setq cut (min cut
+                           (if-let* ((group-id (map-elt state :group-id))
+                                     (header (agent-shell-ui--group-header-range group-id)))
+                               (map-elt header :start)
+                             (prop-match-beginning match)))))
+          (when (> cut (point-min))
+            (let ((inhibit-read-only t)
+                  (buffer-undo-list t))
+              (delete-region (point-min) cut))))))))
+
 (cl-defun agent-shell--make-error-handler (&key state shell-buffer)
   "Create ACP error handler with SHELL-BUFFER STATE."
   (lambda (acp-error raw-message)
@@ -3748,7 +3812,8 @@ DIFFS is a list of diff infos as returned by
                                :data (list (cons :code (map-elt acp-error 'code))
                                            (cons :message (map-elt acp-error 'message))))
       (shell-maker-finish-output :config shell-maker--config
-                                 :success t))))
+                                 :success t)
+      (agent-shell--truncate-buffer))))
 
 (defun agent-shell--save-tool-call (state tool-call-id tool-call)
   "Store TOOL-CALL with TOOL-CALL-ID in STATE's :tool-calls alist."
@@ -7503,6 +7568,7 @@ Each marked span is replaced by its `agent-shell-region-text' value."
                        (agent-shell--prompt-queue-display))
                      (shell-maker-finish-output :config shell-maker--config
                                                 :success t)
+                     (agent-shell--truncate-buffer)
                      (let ((data (list (cons :stop-reason (map-elt acp-response 'stopReason))
                                        (cons :usage (map-elt (agent-shell--state) :usage)))))
                        (agent-shell--emit-event
