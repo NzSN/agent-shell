@@ -41,7 +41,8 @@ and per-chunk work degrades quadratically as messages stream in.
 | `73275c7` | Fragment ranges (block/body/labels) computed once and cached as markers in the fragment state's `:range-markers` alist, replacing ~7 per-chunk interval walks with O(1) marker reads. Markers released on fragment delete, regenerate, and truncation. |
 | `b6db556` | Bug fix for the above: section-end markers now use insertion-type `t`, so they advance past insertions at their position — including the inline-code renderer's delete-and-reinsert of a span that closes exactly at the streamed body end (previously scrambled trailing code spans). |
 | `1b3dc9d` | Review fixups: indentation, `map-put!` convention. |
-| `HEAD` | Old fragments (no `:range-markers` key) now cache via in-place alist growth (`nconc`), plus a test for marker release on truncation. |
+| `0f6a545` | Old fragments (no `:range-markers` key) now cache via in-place alist growth (`nconc`), plus a test for marker release on truncation. |
+| `HEAD` | Remaining tails: `tool_call_update` appends the output suffix instead of replacing + re-rendering the whole body (identical resends skipped entirely; 6× faster on expanded tool bodies). Renderer pass markers (source-block ranges, inline-code ranges, frozen ranges, per-block markers) are now detached after use instead of accumulating in the buffer's marker list. `agent-shell-cache-dir` is memoized (was an `expand-file-name` + `make-directory` syscall per chunk). |
 
 ## Verification
 
@@ -59,12 +60,11 @@ and per-chunk work degrades quadratically as messages stream in.
 - Truncation is **enabled by default** (10000 lines) — visible old content
   disappears from the buffer (transcript retains it). Line-based, so a
   pathological single-line megablob is only bounded at fragment granularity.
-- Not addressed (remaining quadratic tails):
-  - `tool_call_update` replaces + re-renders the whole tool body per update
-    (O(output²)).
-  - Tables re-render per streamed row (kept for live alignment).
-  - Renderer-created per-pass markers are still not released
-    (pre-existing marker-list bloat).
-  - `agent-shell-cache-dir` calls `expand-file-name` per chunk (~4%).
+- Tables: still re-render per streamed row. A defer-to-close redesign
+  was attempted and reverted: live row-folding into an extending table
+  is designed behavior (covered by `table-extends-on-streamed-rows`,
+  `table-below-gap-held-back-for-pending-row`, and the pending-table
+  watermark tests). A proper fix needs incremental width handling, not
+  deferral.
 - Suggested upstream path: split into 3 PRs (truncation / fence deferral /
   marker-cache+pad-gate) per the maintainer's small-PR preference.

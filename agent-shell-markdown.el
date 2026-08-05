@@ -514,7 +514,23 @@ body un-fontified."
       (agent-shell-markdown--update-watermark
        :source-blocks source-blocks
        :external-candidates (seq-keep (lambda (result) (map-elt result :watermark))
-                                      external-results)))))))
+                                      external-results))
+      ;; The pass allocates a fresh batch of markers on every call
+      ;; (source-block ranges, inline-code ranges, frozen ranges) and
+      ;; nothing referenced them past this point.  Detach them so they
+      ;; don't accumulate in the buffer's marker list — with thousands
+      ;; lingering, every buffer edit pays O(markers).
+      (agent-shell-markdown--release-markers inline-ranges)
+      (agent-shell-markdown--release-markers rendered-ranges)
+      (dolist (source-block source-blocks)
+        (set-marker (map-nested-elt source-block '(:block :start)) nil)
+        (set-marker (map-nested-elt source-block '(:block :end)) nil)))))))
+
+(defun agent-shell-markdown--release-markers (ranges)
+  "Detach every marker in RANGES (a list of (START . END) marker conses)."
+  (dolist (range ranges)
+    (set-marker (car range) nil)
+    (set-marker (cdr range) nil)))
 
 (defun agent-shell-markdown--source-block-ranges (source-blocks)
   "Project SOURCE-BLOCKS to sorted (START . END) marker ranges.
@@ -1489,10 +1505,17 @@ Returns non-nil when at least one block was rendered this call."
                 ;; above.
                 (put-text-property (marker-position body-start) panel-bottom
                                    'agent-shell-markdown-source-block-rendered t))
-               ;; Move point past the body so the outer `re-search-forward'
-               ;; loop doesn't backtrack into body content (e.g. shorter
-               ;; inner fences inside a wider outer fence).
-               (goto-char (marker-position body-end)))))))
+               ;; Detach the block's markers: nothing uses them past
+               ;; this point, and leaving one batch per rendered block
+               ;; bloats the buffer's marker list.
+               (let ((block-tail (marker-position body-end)))
+                 (set-marker body-start nil)
+                 (set-marker body-end nil)
+                 (set-marker content-start nil)
+                 ;; Move point past the body so the outer `re-search-forward'
+                 ;; loop doesn't backtrack into body content (e.g. shorter
+                 ;; inner fences inside a wider outer fence).
+                 (goto-char block-tail)))))))
      rendered))
 
 (defconst agent-shell-markdown--table-line-regexp
