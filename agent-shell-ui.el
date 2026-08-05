@@ -519,15 +519,15 @@ are preserved across label updates."
                      (agent-shell-ui--toggle-fragment-at-point))
                    (lambda ()
                      (message "Press RET to toggle"))))
-           (let ((insert-end (point)))
-             (add-text-properties insert-start insert-end
-                                  `(agent-shell-ui-section ,section
-                                                           help-echo ,(agent-shell-ui--fragment-help-echo qualified-id)
-                                                           read-only t
-                                                           front-sticky (read-only)))
-             (when state
-               (put-text-property insert-start insert-end
-                                  'agent-shell-ui-state state))))))))
+          (let ((insert-end (point)))
+            (add-text-properties insert-start insert-end
+                                 `(agent-shell-ui-section ,section
+                                                          help-echo ,(agent-shell-ui--fragment-help-echo qualified-id)
+                                                          read-only t
+                                                          front-sticky (read-only)))
+            (when state
+              (put-text-property insert-start insert-end
+                                 'agent-shell-ui-state state))))))))
 
 
 (cl-defun agent-shell-ui-delete-fragment (&key namespace-id block-id no-undo)
@@ -625,8 +625,8 @@ delete-and-reinsert of a trailing span, framing gaps), so reads are
 O(1)."
   (if (assq :range-markers state)
       (or (map-elt state :range-markers)
-          (setf (map-elt state :range-markers)
-                (agent-shell-ui--compute-range-markers block-start)))
+          (map-put! state :range-markers
+                    (agent-shell-ui--compute-range-markers block-start)))
     ;; A fragment from before marker caching existed: compute without
     ;; caching (the state alist can't grow new keys in place).
     (agent-shell-ui--compute-range-markers block-start)))
