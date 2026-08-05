@@ -5126,5 +5126,41 @@ when it alone exceeds `agent-shell-buffer-maximum-size'."
       (should-not (agent-shell-tests--fragment-present-p "ns-g2"))
       (should (agent-shell-tests--fragment-present-p "ns-new2")))))
 
+(cl-defun agent-shell-tests--update-and-render (model &key append create-new)
+  "Update fragment with MODEL and render the body, like agent-shell--update-fragment."
+  (let ((inhibit-read-only t))
+    (when-let* ((range (agent-shell-ui-update-fragment model
+                                                       :append append
+                                                       :create-new create-new
+                                                       :navigation 'always))
+                (body-start (map-nested-elt range '(:body :start)))
+                (body-end (map-nested-elt range '(:body :end))))
+      (save-restriction
+        (narrow-to-region body-start body-end)
+        (agent-shell--render-markdown)
+        (widen)))))
+
+(ert-deftest agent-shell-trailing-code-span-stays-in-place-test ()
+  "An inline code span at the body's end must not move when more text streams in.
+
+The inline-code renderer deletes a span and re-inserts its content at
+the same spot.  With a stale body-end position, the next append would
+land before the re-inserted content (regression: span content moved to
+the body's end when the span closed exactly at the streamed tail)."
+  (with-temp-buffer
+    (agent-shell-ui-mode 1)
+    (agent-shell-tests--update-and-render
+     (agent-shell-ui-make-fragment-model
+      :namespace-id "ns" :block-id "1"
+      :body "streamed text with a `code-span`")
+     :create-new t)
+    (agent-shell-tests--update-and-render
+     (agent-shell-ui-make-fragment-model
+      :namespace-id "ns" :block-id "1"
+      :body " and a trailing chunk")
+     :append t)
+    (should (equal (substring-no-properties (buffer-string))
+                   "\n\nstreamed text with a code-span and a trailing chunk\n\n"))))
+
 (provide 'agent-shell-tests)
 ;;; agent-shell-tests.el ends here

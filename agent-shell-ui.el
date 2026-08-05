@@ -435,15 +435,7 @@ state, because label-less fragments don't follow `state :collapsed'
           (agent-shell-ui--apply-body-section-properties
            insert-start insert-end qualified-id state body-invisible)
           (agent-shell-ui--apply-trailing-whitespace-invisible
-           body-start insert-end)
-          ;; Keep the cached range markers current: the body grew, and
-          ;; the block's end grows with it when the body is last.
-          (when-let* ((markers (map-elt state :range-markers))
-                      (body-end-marker (map-elt markers :body-end)))
-            (set-marker body-end-marker insert-end)
-            (when-let* ((block-end-marker (map-elt markers :block-end))
-                        ((= (marker-position block-end-marker) body-end)))
-              (set-marker block-end-marker insert-end))))))))
+           body-start insert-end))))))
 
 (defun agent-shell-ui--replace-body (body-range new-body qualified-id _collapsed)
   "Replace the body region described by BODY-RANGE with NEW-BODY.
@@ -459,12 +451,7 @@ matches the body's current visibility, not caller-supplied state."
          (body-end (map-elt body-range :end))
          (state (get-text-property (max body-start (1- body-end))
                                    'agent-shell-ui-state))
-         (body-invisible (agent-shell-ui--body-invisible-p body-start body-end))
-         (markers (map-elt state :range-markers))
-         (block-extends-with-body
-          (and markers
-               (map-elt markers :block-end)
-               (= (marker-position (map-elt markers :block-end)) body-end))))
+         (body-invisible (agent-shell-ui--body-invisible-p body-start body-end)))
     (delete-region body-start body-end)
     (goto-char body-start)
     (when (and (stringp new-body) (not (string-empty-p new-body)))
@@ -481,12 +468,7 @@ matches the body's current visibility, not caller-supplied state."
             (agent-shell-ui--apply-body-section-properties
              insert-start insert-end qualified-id state body-invisible)
             (agent-shell-ui--apply-trailing-whitespace-invisible
-             insert-start insert-end)
-            ;; Keep the cached range markers current after the swap.
-            (when-let* ((body-end-marker (map-elt markers :body-end)))
-              (set-marker body-end-marker insert-end))
-            (when block-extends-with-body
-              (set-marker (map-elt markers :block-end) insert-end))))))))
+             insert-start insert-end)))))))
 
 (defun agent-shell-ui--replace-label (qualified-id section new-text)
   "Replace the SECTION region of fragment QUALIFIED-ID with NEW-TEXT.
@@ -526,12 +508,7 @@ are preserved across label updates."
                                (buffer-substring-no-properties (car region) (cdr region))))))
       (let* ((region-start (car region))
              (region-end (cdr region))
-             (state (get-text-property region-start 'agent-shell-ui-state))
-             (markers (map-elt state :range-markers))
-             (block-extends-with-section
-              (and markers
-                   (map-elt markers :block-end)
-                   (= (marker-position (map-elt markers :block-end)) region-end))))
+             (state (get-text-property region-start 'agent-shell-ui-state)))
         (delete-region region-start region-end)
         (goto-char region-start)
         (let ((insert-start (point)))
@@ -550,14 +527,7 @@ are preserved across label updates."
                                                            front-sticky (read-only)))
              (when state
                (put-text-property insert-start insert-end
-                                  'agent-shell-ui-state state))
-             ;; Keep the cached range markers current: the label's end
-             ;; moved, and the block's end moves with the last section.
-              (when-let* ((end-marker (map-elt markers
-                                               (intern (format ":%s-end" section)))))
-                (set-marker end-marker insert-end)
-                (when block-extends-with-section
-                  (set-marker (map-elt markers :block-end) insert-end)))))))))
+                                  'agent-shell-ui-state state))))))))
 
 
 (cl-defun agent-shell-ui-delete-fragment (&key namespace-id block-id no-undo)
@@ -625,7 +595,7 @@ updates don't re-walk the block's property intervals."
                                    :end)
                           block-start))
            (markers (list (cons :block-start (copy-marker block-start t))
-                          (cons :block-end (copy-marker block-end)))))
+                          (cons :block-end (copy-marker block-end t)))))
       (dolist (section '(body label-left label-right))
         (when-let* ((range (agent-shell-ui--nearest-range-matching-property
                             :property 'agent-shell-ui-section :value section
@@ -633,8 +603,12 @@ updates don't re-walk the block's property intervals."
           (push (cons (intern (format ":%s-start" section))
                       (copy-marker (map-elt range :start)))
                 markers)
+          ;; End markers advance past text inserted at their position:
+          ;; chunk appends, the renderer's delete-and-reinsert of a
+          ;; trailing inline-code span, and framing gap inserts all land
+          ;; exactly at a section end and must extend it.
           (push (cons (intern (format ":%s-end" section))
-                      (copy-marker (map-elt range :end)))
+                      (copy-marker (map-elt range :end) t))
                 markers)))
       (nreverse markers))))
 
@@ -645,10 +619,10 @@ The fragment's block/body/label ranges as an alist of markers (see
 `agent-shell-ui--compute-range-markers').  Cached on STATE's
 :range-markers because recomputing the ranges per streamed chunk
 walks the block's whole property-interval tree — O(intervals) per
-chunk, O(chunks x intervals) per message.  The mutation paths
-\(`agent-shell-ui--append-body', `agent-shell-ui--replace-body',
-`agent-shell-ui--replace-label') keep the end markers current, so
-reads are O(1)."
+chunk, O(chunks x intervals) per message.  End markers advance past
+insertions at their position (chunk appends, the renderer's
+delete-and-reinsert of a trailing span, framing gaps), so reads are
+O(1)."
   (if (assq :range-markers state)
       (or (map-elt state :range-markers)
           (setf (map-elt state :range-markers)
