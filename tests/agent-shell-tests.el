@@ -5162,5 +5162,35 @@ the body's end when the span closed exactly at the streamed tail)."
     (should (equal (substring-no-properties (buffer-string))
                    "\n\nstreamed text with a code-span and a trailing chunk\n\n"))))
 
+(ert-deftest agent-shell-truncate-buffer-releases-range-markers-test ()
+  "Truncation releases the cached range markers of deleted fragments.
+Markers of the newest surviving fragment stay valid."
+  (with-temp-buffer
+    (agent-shell-ui-mode 1)
+    (agent-shell-tests--insert-fragments '("1" "2" "3" "4" "5"))
+    (let ((states nil))
+      ;; Populate the marker caches on every fragment.
+      (dolist (id '("1" "2" "3" "4" "5"))
+        (goto-char (point-min))
+        (when-let* ((m (text-property-search-forward
+                        'agent-shell-ui-state nil
+                        (lambda (_ state)
+                          (equal (map-elt state :qualified-id)
+                                 (format "ns-%s" id))))))
+          (agent-shell-ui--fragment-ranges (prop-match-beginning m))
+          (push (get-text-property (prop-match-beginning m)
+                                   'agent-shell-ui-state)
+                states)))
+      (dolist (state states)
+        (should (map-elt state :range-markers)))
+      (let ((agent-shell-buffer-maximum-size 3))
+        (agent-shell--truncate-buffer))
+      (dolist (state states)
+        (if (equal (map-elt state :qualified-id) "ns-5")
+            (dolist (cell (map-elt state :range-markers))
+              (should (marker-buffer (cdr cell))))
+          (dolist (cell (map-elt state :range-markers))
+            (should-not (marker-buffer (cdr cell)))))))))
+
 (provide 'agent-shell-tests)
 ;;; agent-shell-tests.el ends here

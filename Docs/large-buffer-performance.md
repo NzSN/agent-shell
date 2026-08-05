@@ -41,6 +41,7 @@ and per-chunk work degrades quadratically as messages stream in.
 | `73275c7` | Fragment ranges (block/body/labels) computed once and cached as markers in the fragment state's `:range-markers` alist, replacing ~7 per-chunk interval walks with O(1) marker reads. Markers released on fragment delete, regenerate, and truncation. |
 | `b6db556` | Bug fix for the above: section-end markers now use insertion-type `t`, so they advance past insertions at their position — including the inline-code renderer's delete-and-reinsert of a span that closes exactly at the streamed body end (previously scrambled trailing code spans). |
 | `1b3dc9d` | Review fixups: indentation, `map-put!` convention. |
+| `HEAD` | Old fragments (no `:range-markers` key) now cache via in-place alist growth (`nconc`), plus a test for marker release on truncation. |
 
 ## Verification
 
@@ -58,8 +59,6 @@ and per-chunk work degrades quadratically as messages stream in.
 - Truncation is **enabled by default** (10000 lines) — visible old content
   disappears from the buffer (transcript retains it). Line-based, so a
   pathological single-line megablob is only bounded at fragment granularity.
-- Fragments created before marker caching existed (no `:range-markers` key)
-  compute ranges per chunk without caching — transient, ~8 vs 6 searches.
 - Not addressed (remaining quadratic tails):
   - `tool_call_update` replaces + re-renders the whole tool body per update
     (O(output²)).
