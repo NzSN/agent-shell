@@ -2986,7 +2986,22 @@ No-op while that function has nothing to summarize (an empty group)."
                     (input-block (when (and (member tool-call-kind '(nil "other"))
                                             saved-input
                                             (not saved-command))
-                                   (agent-shell--format-tool-call-input saved-input))))
+                                   (agent-shell--format-tool-call-input saved-input)))
+                    (full-body (cond
+                                (command-block
+                                 (concat command-block "\n\n" (string-trim body-text)))
+                                (input-block
+                                 (concat input-block "\n\n" (string-trim body-text)))
+                                (t
+                                 (string-trim body-text))))
+                    ;; Tool output typically only grows: append the
+                    ;; suffix rather than replacing and re-rendering the
+                    ;; whole body on every update (O(output^2) per
+                    ;; call).  Identical resends skip the body entirely.
+                    (body-update (agent-shell--tool-call-body-update
+                                  :state state
+                                  :tool-call-id tool-call-id
+                                  :full-body full-body)))
                (agent-shell--update-fragment
                 :state state
                 :block-id (map-nested-elt acp-notification '(params update toolCallId))
@@ -2995,15 +3010,11 @@ No-op while that function has nothing to summarize (an empty group)."
                 :group-id group-id
                 :group-label agent-shell--activity-group-label
                 :group-expanded agent-shell-activity-group-expand-by-default
-                :body (cond
-                       (command-block
-                        (concat command-block "\n\n" (string-trim body-text)))
-                       (input-block
-                        (concat input-block "\n\n" (string-trim body-text)))
-                       (t
-                        (string-trim body-text)))
+                :body (map-elt body-update :body)
+                :append (map-elt body-update :append)
                 :expanded agent-shell-tool-use-expand-by-default
                 :above-last-prompt (not (agent-shell--active-requests-p state)))
+               (agent-shell--record-tool-call-body state tool-call-id full-body)
                (agent-shell--refresh-activity-group-header state group-id))
              ;; Only advance the run boundary when this update introduced a new
              ;; tool call (appended at the end).  An in-place update of an
@@ -3336,25 +3347,31 @@ function before returning."
   "Resolve PATH using `agent-shell-path-resolver-function'."
   (funcall (or agent-shell-path-resolver-function #'identity) path))
 
+(defvar agent-shell--cache-dir-table (make-hash-table :test 'equal)
+  "Memoized results of `agent-shell-cache-dir', keyed by COMPONENTS.")
+
 (defun agent-shell-cache-dir (&rest components)
   "Return the `agent-shell' cache directory, creating it if needed.
 
 The base location is system-dependent and honors `XDG_CACHE_HOME'
 when set.  COMPONENTS, if given, name a subdirectory beneath the
 cache directory, which is created as well.  Return the absolute
-path of the resulting directory."
-  (let* ((base (or (getenv "XDG_CACHE_HOME")
-                   (pcase system-type
-                     ('darwin (expand-file-name "Library/Caches" "~"))
-                     ('windows-nt (or (getenv "LOCALAPPDATA") (getenv "APPDATA")))
-                     ;; Emacs write getCacheDir() into this environment variable
-                     ('android (getenv "TMPDIR"))
-                     ((or 'ms-dos 'cygwin 'haiku) nil)
-                     (_ (expand-file-name ".cache" "~")))
-                   (expand-file-name "cache" user-emacs-directory)))
-         (cache-dir (apply #'file-name-concat base "agent-shell" components)))
-    (make-directory cache-dir t)
-    cache-dir))
+path of the resulting directory.
+
+Results are memoized per COMPONENTS."
+  (or (gethash components agent-shell--cache-dir-table)
+      (let* ((base (or (getenv "XDG_CACHE_HOME")
+                       (pcase system-type
+                         ('darwin (expand-file-name "Library/Caches" "~"))
+                         ('windows-nt (or (getenv "LOCALAPPDATA") (getenv "APPDATA")))
+                         ;; Emacs write getCacheDir() into this environment variable
+                         ('android (getenv "TMPDIR"))
+                         ((or 'ms-dos 'cygwin 'haiku) nil)
+                         (_ (expand-file-name ".cache" "~")))
+                       (expand-file-name "cache" user-emacs-directory)))
+             (cache-dir (apply #'file-name-concat base "agent-shell" components)))
+        (make-directory cache-dir t)
+        (puthash components cache-dir agent-shell--cache-dir-table))))
 
 (defun agent-shell--stop-reason-description (stop-reason)
   "Return a human-readable text description for STOP-REASON.
@@ -3798,6 +3815,49 @@ fragment (or activity group) is always kept intact."
             (let ((inhibit-read-only t)
                   (buffer-undo-list t))
               (delete-region (point-min) cut))))))))
+
+(cl-defun agent-shell--tool-call-body-update (&key state tool-call-id full-body)
+  "Compute the incremental body update for TOOL-CALL-ID from FULL-BODY.
+
+Returns (:body BODY :append APPEND) — the suffix to append when the
+tool output only grew since the last update, a nil BODY to skip an
+identical resend, or the full body for a replacement (also when the
+fragment is gone from the buffer, e.g. truncated)."
+  (let* ((last-sent (map-nested-elt state (list :tool-calls tool-call-id :last-sent-body)))
+         (fragment-exists
+          (and last-sent
+               (with-current-buffer (map-elt state :buffer)
+                 (save-excursion
+                   (goto-char (point-max))
+                   (text-property-search-backward
+                    'agent-shell-ui-state nil
+                    (lambda (_ s)
+                      (equal (map-elt s :qualified-id)
+                             (format "%s-%s" (map-elt state :request-count)
+                                     tool-call-id)))
+                    t))))))
+    (cond
+     ((equal full-body last-sent)
+      (list (cons :body nil) (cons :append nil)))
+     ((and fragment-exists (string-prefix-p last-sent full-body))
+      (list (cons :body (substring full-body (length last-sent)))
+            (cons :append t)))
+     (t
+      (list (cons :body full-body) (cons :append nil))))))
+
+(defun agent-shell--record-tool-call-body (state tool-call-id full-body)
+  "Remember FULL-BODY as the last body sent for TOOL-CALL-ID in STATE.
+The next `agent-shell--tool-call-body-update' diffs against it.  The
+tool-call alist is a plain list; its new key grows at the tail."
+  (if-let* ((tool-call (map-nested-elt state (list :tool-calls tool-call-id))))
+      (progn
+        (unless (assq :last-sent-body tool-call)
+          (nconc tool-call (list (cons :last-sent-body nil))))
+        (map-put! tool-call :last-sent-body full-body))
+    (map-put! state :tool-calls
+              (cons (cons tool-call-id
+                          (list (cons :last-sent-body full-body)))
+                    (map-elt state :tool-calls)))))
 
 (cl-defun agent-shell--make-error-handler (&key state shell-buffer)
   "Create ACP error handler with SHELL-BUFFER STATE."

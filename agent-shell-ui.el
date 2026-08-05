@@ -519,15 +519,15 @@ are preserved across label updates."
                      (agent-shell-ui--toggle-fragment-at-point))
                    (lambda ()
                      (message "Press RET to toggle"))))
-           (let ((insert-end (point)))
-             (add-text-properties insert-start insert-end
-                                  `(agent-shell-ui-section ,section
-                                                           help-echo ,(agent-shell-ui--fragment-help-echo qualified-id)
-                                                           read-only t
-                                                           front-sticky (read-only)))
-             (when state
-               (put-text-property insert-start insert-end
-                                  'agent-shell-ui-state state))))))))
+          (let ((insert-end (point)))
+            (add-text-properties insert-start insert-end
+                                 `(agent-shell-ui-section ,section
+                                                          help-echo ,(agent-shell-ui--fragment-help-echo qualified-id)
+                                                          read-only t
+                                                          front-sticky (read-only)))
+            (when state
+              (put-text-property insert-start insert-end
+                                 'agent-shell-ui-state state))))))))
 
 
 (cl-defun agent-shell-ui-delete-fragment (&key namespace-id block-id no-undo)
@@ -623,13 +623,15 @@ chunk, O(chunks x intervals) per message.  End markers advance past
 insertions at their position (chunk appends, the renderer's
 delete-and-reinsert of a trailing span, framing gaps), so reads are
 O(1)."
-  (if (assq :range-markers state)
-      (or (map-elt state :range-markers)
-          (setf (map-elt state :range-markers)
-                (agent-shell-ui--compute-range-markers block-start)))
-    ;; A fragment from before marker caching existed: compute without
-    ;; caching (the state alist can't grow new keys in place).
-    (agent-shell-ui--compute-range-markers block-start)))
+  (or (map-elt state :range-markers)
+      (let ((markers (agent-shell-ui--compute-range-markers block-start)))
+        (if (assq :range-markers state)
+            (map-put! state :range-markers markers)
+          ;; A fragment from before marker caching existed: its state
+          ;; lacks the key, but an alist always grows in place at the
+          ;; tail, and the text property references the same list.
+          (nconc state (list (cons :range-markers markers))))
+        markers)))
 
 (defun agent-shell-ui--range-marker-position (markers name)
   "Return the position of NAME in range MARKERS alist, or nil when unset."
