@@ -3358,8 +3358,7 @@ when set.  COMPONENTS, if given, name a subdirectory beneath the
 cache directory, which is created as well.  Return the absolute
 path of the resulting directory.
 
-Results are memoized: the path computation and `make-directory'
-ran on every streamed image-bearing chunk."
+Results are memoized per COMPONENTS."
   (or (gethash components agent-shell--cache-dir-table)
       (let* ((base (or (getenv "XDG_CACHE_HOME")
                        (pcase system-type
