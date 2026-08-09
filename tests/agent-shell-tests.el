@@ -5197,39 +5197,194 @@ Markers of the newest surviving fragment stay valid."
   (let ((state (list (cons :request-count 0)
                      (cons :buffer (current-buffer))
                      (cons :tool-calls nil))))
-    ;; First update: full body.
+    ;; First update: full body (assembled, trailing whitespace trimmed).
     (should (equal (agent-shell--tool-call-body-update
-                    :state state :tool-call-id "t1" :full-body "out1\n")
-                   '((:body . "out1\n") (:append))))
-    (agent-shell--record-tool-call-body state "t1" "out1\n")
-    ;; Extension: append the suffix.
+                    :state state :tool-call-id "t1" :header nil
+                    :content '(((content . ((type . "text") (text . "out1\n")))))
+                    :diff-text nil)
+                   '((:body . "out1") (:append))))
+    ;; The fragment now exists with the sent body.
     (agent-shell-ui-update-fragment
      (agent-shell-ui-make-fragment-model
-      :namespace-id 0 :block-id "t1" :label-left "run" :body "out1\n")
+      :namespace-id 0 :block-id "t1" :label-left "run" :body "out1")
      :navigation 'always)
+    ;; The single content item grew: append only the growth.
     (should (equal (agent-shell--tool-call-body-update
-                    :state state :tool-call-id "t1" :full-body "out1\nout2\n")
-                   '((:body . "out2\n") (:append . t))))
-    (agent-shell--record-tool-call-body state "t1" "out1\nout2\n")
+                    :state state :tool-call-id "t1" :header nil
+                    :content '(((content . ((type . "text") (text . "out1\nout2\n")))))
+                    :diff-text nil)
+                   '((:body . "\nout2") (:append . t))))
     ;; Identical resend: skip.
     (should (equal (agent-shell--tool-call-body-update
-                    :state state :tool-call-id "t1" :full-body "out1\nout2\n")
+                    :state state :tool-call-id "t1" :header nil
+                    :content '(((content . ((type . "text") (text . "out1\nout2\n")))))
+                    :diff-text nil)
                    '((:body) (:append))))
-    ;; Changed content: replace.
+    ;; Changed content: replace with the full body.
     (should (equal (agent-shell--tool-call-body-update
-                    :state state :tool-call-id "t1" :full-body "different\n")
-                   '((:body . "different\n") (:append))))))
+                    :state state :tool-call-id "t1" :header nil
+                    :content '(((content . ((type . "text") (text . "different\n")))))
+                    :diff-text nil)
+                   '((:body . "different") (:append))))))
 
 (ert-deftest agent-shell-tool-call-body-update-replace-when-fragment-gone-test ()
   "A suffix append falls back to replace when the fragment is gone."
   (let ((state (list (cons :request-count 0)
                      (cons :buffer (current-buffer))
                      (cons :tool-calls nil))))
-    (agent-shell--record-tool-call-body state "t1" "out1\n")
+    (agent-shell--tool-call-body-update
+     :state state :tool-call-id "t1" :header nil
+     :content '(((content . ((type . "text") (text . "out1\n")))))
+     :diff-text nil)
     ;; No fragment in the buffer: extension must become a full replace.
     (should (equal (agent-shell--tool-call-body-update
-                    :state state :tool-call-id "t1" :full-body "out1\nout2\n")
-                   '((:body . "out1\nout2\n") (:append))))))
+                    :state state :tool-call-id "t1" :header nil
+                    :content '(((content . ((type . "text") (text . "out1\nout2\n")))))
+                    :diff-text nil)
+                   '((:body . "out1\nout2") (:append))))))
+
+(ert-deftest agent-shell-tool-call-body-update-appends-new-items-test ()
+  "New content items append with a blank-line separator."
+  (let ((state (list (cons :request-count 0)
+                     (cons :buffer (current-buffer))
+                     (cons :tool-calls nil))))
+    (agent-shell--tool-call-body-update
+     :state state :tool-call-id "t1" :header nil
+     :content '(((content . ((type . "text") (text . "out1")))))
+     :diff-text nil)
+    (agent-shell-ui-update-fragment
+     (agent-shell-ui-make-fragment-model
+      :namespace-id 0 :block-id "t1" :label-left "run" :body "out1")
+     :navigation 'always)
+    (should (equal (agent-shell--tool-call-body-update
+                    :state state :tool-call-id "t1" :header nil
+                    :content '(((content . ((type . "text") (text . "out1"))))
+                               ((content . ((type . "text") (text . "out2")))))
+                    :diff-text nil)
+                   '((:body . "\n\nout2") (:append . t))))))
+
+(ert-deftest agent-shell-tool-call-body-update-appends-new-diff-test ()
+  "A diff appearing after streamed output appends past the output's trimmed tail."
+  (let ((state (list (cons :request-count 0)
+                     (cons :buffer (current-buffer))
+                     (cons :tool-calls nil))))
+    ;; Output ends in a newline, trimmed off the sent body's trailing edge.
+    (agent-shell--tool-call-body-update
+     :state state :tool-call-id "t1" :header nil
+     :content '(((content . ((type . "text") (text . "out\n")))))
+     :diff-text nil)
+    (agent-shell-ui-update-fragment
+     (agent-shell-ui-make-fragment-model
+      :namespace-id 0 :block-id "t1" :label-left "run" :body "out")
+     :navigation 'always)
+    ;; The diff lands after the output's (previously trimmed) trailing
+    ;; newline plus the output/diff separator: five newlines total.
+    (should (equal (agent-shell--tool-call-body-update
+                    :state state :tool-call-id "t1" :header nil
+                    :content '(((content . ((type . "text") (text . "out\n")))))
+                    :diff-text "DIFF-TEXT")
+                   '((:body . "\n\n\n\n\nDIFF-TEXT") (:append . t))))))
+
+(ert-deftest agent-shell-tool-call-body-update-replaces-when-diff-moves-test ()
+  "Item growth after a diff was sent displaces the diff: full replace."
+  (let ((state (list (cons :request-count 0)
+                     (cons :buffer (current-buffer))
+                     (cons :tool-calls (list (cons "t1" (list (cons :diffs '(((:old . "a") (:new . "b")))))))))))
+    (agent-shell--tool-call-body-update
+     :state state :tool-call-id "t1" :header nil
+     :content '(((content . ((type . "text") (text . "out")))))
+     :diff-text "DIFF-TEXT")
+    (agent-shell-ui-update-fragment
+     (agent-shell-ui-make-fragment-model
+      :namespace-id 0 :block-id "t1" :label-left "run" :body "out\n\n\n\nDIFF-TEXT")
+     :navigation 'always)
+    (should (equal (agent-shell--tool-call-body-update
+                    :state state :tool-call-id "t1" :header nil
+                    :content '(((content . ((type . "text") (text . "out\nmore")))))
+                    :diff-text "DIFF-TEXT")
+                   '((:body . "out\nmore\n\n\n\nDIFF-TEXT") (:append))))))
+
+(ert-deftest agent-shell-make-tool-call-body-test ()
+  "Body assembly: header prefix, joined items, diff separation, trimming."
+  (should (equal (agent-shell--make-tool-call-body
+                  :header "```console\nls -la\n```"
+                  :content '(((content . ((type . "text") (text . "file1"))))
+                             ((content . ((type . "text") (text . "file2")))))
+                  :diff-text nil)
+                 "```console\nls -la\n```\n\nfile1\n\nfile2"))
+  ;; Header only: trailing separator kept (matches streaming assembly).
+  (should (equal (agent-shell--make-tool-call-body
+                  :header "```console\nls\n```" :content nil :diff-text nil)
+                 "```console\nls\n```\n\n"))
+  ;; Diff after output: double blank line between them.
+  (should (equal (agent-shell--make-tool-call-body
+                  :header nil
+                  :content '(((content . ((type . "text") (text . "out")))))
+                  :diff-text "DIFF")
+                 "out\n\n\n\nDIFF"))
+  ;; Diff without output: no separator.
+  (should (equal (agent-shell--make-tool-call-body
+                  :header nil :content nil :diff-text "DIFF")
+                 "DIFF"))
+  ;; Items without a `content' key are skipped.
+  (should (equal (agent-shell--make-tool-call-body
+                  :header nil
+                  :content '(((type . "meta"))
+                             ((content . ((type . "text") (text . "out")))))
+                  :diff-text nil)
+                 "out")))
+
+(ert-deftest agent-shell-tool-call-diff-text-memoized-test ()
+  "Diff text renders once per distinct diffs input (diff(1) is shelled out)."
+  (let ((state (list (cons :request-count 0)
+                     (cons :buffer (current-buffer))
+                     (cons :tool-calls (list (cons "t1" (list (cons :diffs '(((:old . "a") (:new . "b"))))))))))
+        (calls 0))
+    (cl-letf (((symbol-function 'agent-shell--format-diffs-as-text)
+               (lambda (_diffs) (setq calls (1+ calls)) "DIFF")))
+      ;; First call computes and a body update records it.
+      (should (equal "DIFF" (agent-shell--tool-call-diff-text
+                             state "t1" '(((:old . "a") (:new . "b"))))))
+      (should (= 1 calls))
+      (agent-shell--tool-call-body-update
+       :state state :tool-call-id "t1" :header nil
+       :content '(((content . ((type . "text") (text . "out")))))
+       :diff-text "DIFF")
+      ;; Same input: cached.
+      (should (equal "DIFF" (agent-shell--tool-call-diff-text
+                             state "t1" '(((:old . "a") (:new . "b"))))))
+      (should (= 1 calls))
+      ;; Changed input: recomputed.
+      (agent-shell--tool-call-diff-text state "t1" '(((:old . "a") (:new . "c"))))
+      (should (= 2 calls)))))
+
+(ert-deftest agent-shell-activity-group-header-unchanged-label-skips-update-test ()
+  "A recomputed-but-identical group label skips the buffer update."
+  (with-temp-buffer
+    (let ((agent-shell-activity-group-header-label-function
+           #'agent-shell-activity-group-count-label)
+          (state (list (cons :request-count 0)
+                       (cons :buffer (current-buffer))
+                       (cons :active-requests t)
+                       (cons :tool-calls (list (cons "A" (list (cons :group-id "g1")
+                                                               (cons :status "completed")))))
+                       (cons :activity-thoughts nil)
+                       (cons :activity-group-labels nil)))
+          (updates 0))
+      (cl-letf (((symbol-function 'agent-shell--update-fragment)
+                 (lambda (&rest _) (setq updates (1+ updates)))))
+        ;; The header fragment must exist for the skip to apply.
+        (agent-shell-ui-update-fragment
+         (agent-shell-ui-make-group-model
+          :namespace-id 0 :block-id "g1" :label-left "Activity")
+         :navigation 'always)
+        (agent-shell--refresh-activity-group-header state "g1")
+        (agent-shell--refresh-activity-group-header state "g1")
+        (should (= 1 updates))
+        ;; A status change recomputes the label: update goes through.
+        (map-put! (map-elt (map-elt state :tool-calls) "A") :status "failed")
+        (agent-shell--refresh-activity-group-header state "g1")
+        (should (= 2 updates))))))
 
 (provide 'agent-shell-tests)
 ;;; agent-shell-tests.el ends here

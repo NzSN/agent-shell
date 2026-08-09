@@ -751,6 +751,85 @@ navigatable block, not on the non-navigatable block's own start."
       (dolist (cell (map-elt state :range-markers))
         (should-not (marker-buffer (cdr cell)))))))
 
+(ert-deftest agent-shell-ui-block-start-by-id-cache-test ()
+  "Location cache resolves fragments, drops on delete, repopulates."
+  (with-temp-buffer
+    (agent-shell-ui-mode 1)
+    (agent-shell-ui-update-fragment
+     (agent-shell-ui-make-fragment-model
+      :namespace-id "ns" :block-id "1"
+      :label-left "First" :body "body one")
+     :expanded t :navigation 'always)
+    (agent-shell-ui-update-fragment
+     (agent-shell-ui-make-fragment-model
+      :namespace-id "ns" :block-id "2"
+      :label-left "Second" :body "body two")
+     :expanded t :navigation 'always)
+    ;; Cached at insertion.
+    (should (gethash "ns-1" agent-shell-ui--fragment-locations))
+    (let ((start (agent-shell-ui--block-start-by-id "ns-1")))
+      (should start)
+      (should (equal "ns-1" (map-elt (get-text-property start 'agent-shell-ui-state)
+                                     :qualified-id)))
+      ;; Same position as a search.
+      (should (= start (agent-shell-ui-tests--fragment-start "ns-1"))))
+    ;; Delete drops the entry.
+    (agent-shell-ui-delete-fragment :namespace-id "ns" :block-id "1")
+    (should-not (gethash "ns-1" agent-shell-ui--fragment-locations))
+    (should-not (agent-shell-ui--block-start-by-id "ns-1"))
+    ;; "ns-2" shifted but stays resolvable (marker tracked the deletion).
+    (should (agent-shell-ui--block-start-by-id "ns-2"))))
+
+(ert-deftest agent-shell-ui-group-member-insert-keeps-sibling-markers-test ()
+  "A new group member must not advance the previous member's cached
+end markers past itself: a later body regenerating the first member
+would delete the second, and an append would land after it."
+  (with-temp-buffer
+    (agent-shell-ui-mode 1)
+    ;; A: labels-only member of group g.
+    (agent-shell-ui-update-fragment
+     (agent-shell-ui-make-fragment-model
+      :namespace-id "ns" :block-id "A" :label-left "run A"
+      :group-id "g" :group-label "Activity" :group-expanded t)
+     :expanded t :navigation 'always)
+    ;; B: second member, inserted at A's block end.
+    (agent-shell-ui-update-fragment
+     (agent-shell-ui-make-fragment-model
+      :namespace-id "ns" :block-id "B" :label-left "run B"
+      :group-id "g" :group-label "Activity" :group-expanded t)
+     :expanded t :navigation 'always)
+    ;; A's first body arrives (delete-and-regenerate path): B survives.
+    (agent-shell-ui-update-fragment
+     (agent-shell-ui-make-fragment-model
+      :namespace-id "ns" :block-id "A" :label-left "run A" :body "output A"
+      :group-id "g" :group-label "Activity" :group-expanded t)
+     :expanded t :navigation 'always)
+    (should (agent-shell-ui--block-start-by-id "ns-B"))
+    (should (string-match-p "run B" (buffer-string))))
+  (with-temp-buffer
+    (agent-shell-ui-mode 1)
+    ;; A: member with a body; B arrives after; A's append must land in
+    ;; A's body, before B — not past B's block.
+    (agent-shell-ui-update-fragment
+     (agent-shell-ui-make-fragment-model
+      :namespace-id "ns" :block-id "A" :label-left "run A" :body "out"
+      :group-id "g" :group-label "Activity" :group-expanded t)
+     :expanded t :navigation 'always)
+    (agent-shell-ui-update-fragment
+     (agent-shell-ui-make-fragment-model
+      :namespace-id "ns" :block-id "B" :label-left "run B"
+      :group-id "g" :group-label "Activity" :group-expanded t)
+     :expanded t :navigation 'always)
+    (agent-shell-ui-update-fragment
+     (agent-shell-ui-make-fragment-model
+      :namespace-id "ns" :block-id "A" :body " more"
+      :group-id "g" :group-label "Activity" :group-expanded t)
+     :append t :expanded t :navigation 'always)
+    (let ((grown (string-match "out more" (buffer-string)))
+          (b-label (string-match "run B" (buffer-string))))
+      (should grown)
+      (should (< grown b-label)))))
+
 ;;; provide
 
 (provide 'agent-shell-ui-tests)

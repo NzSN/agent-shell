@@ -1096,6 +1096,7 @@ OUTGOING-REQUEST-DECORATOR (passed through to `acp-make-client')."
         (cons :chunked-group-count 0)
         (cons :activity-group-count 0)
         (cons :activity-thoughts nil)
+        (cons :activity-group-labels nil)
         (cons :request-count 0)
         (cons :last-activity-time nil)
         (cons :tool-calls nil)
@@ -2607,15 +2608,29 @@ style settles; promote it once the rendering choice is worth exposing.")
 (defun agent-shell--refresh-activity-group-header (state group-id)
   "Relabel GROUP-ID's header in STATE from its tool calls and thoughts.
 Delegates to `agent-shell-activity-group-header-label-function'.
-No-op while that function has nothing to summarize (an empty group)."
+No-op while that function has nothing to summarize (an empty group).
+
+Skips the buffer update when the recomputed label is unchanged and
+the header fragment is still present (it could be gone after buffer
+truncation, in which case an identical label must still render)."
   (when-let* ((label (funcall agent-shell-activity-group-header-label-function
                               (list (cons :state state)
                                     (cons :group-id group-id)))))
-    (agent-shell--update-fragment
-     :state state
-     :block-id group-id
-     :label-left label
-     :above-last-prompt (not (agent-shell--active-requests-p state)))))
+    (unless (and (equal (map-nested-elt state (list :activity-group-labels group-id))
+                        label)
+                 (with-current-buffer (map-elt state :buffer)
+                   (agent-shell-ui--block-start-by-id
+                    (format "%s-%s" (map-elt state :request-count) group-id))))
+      (agent-shell--update-fragment
+       :state state
+       :block-id group-id
+       :label-left label
+       :above-last-prompt (not (agent-shell--active-requests-p state)))
+      (if-let* ((entry (assoc group-id (map-elt state :activity-group-labels))))
+          (setcdr entry label)
+        (map-put! state :activity-group-labels
+                  (cons (cons group-id label)
+                        (map-elt state :activity-group-labels)))))))
 
 (cl-defun agent-shell--on-notification (&key state acp-notification)
   "Handle incoming ACP-NOTIFICATION using STATE."
@@ -2924,24 +2939,17 @@ No-op while that function has nothing to summarize (an empty group)."
             :event 'tool-call-update
             :data (list (cons :tool-call-id (map-nested-elt acp-notification '(params update toolCallId)))
                         (cons :tool-call (map-nested-elt state `(:tool-calls ,(map-nested-elt acp-notification '(params update toolCallId)))))))
-           (let* ((diffs (map-nested-elt state `(:tool-calls ,(map-nested-elt acp-notification '(params update toolCallId)) :diffs)))
-                  (output (concat
-                           "\n\n"
-                           (mapconcat #'agent-shell--content-block-to-markdown
-                                      (seq-keep (lambda (item) (map-elt item 'content))
-                                                (map-nested-elt acp-notification '(params update content)))
-                                      "\n\n")
-                           "\n\n"))
-                  (diff-text (agent-shell--format-diffs-as-text diffs))
-                  (body-text (if diff-text
-                                 (concat output "\n\n" diff-text)
-                               output))
-                  ;; Whether this update introduces a new tool call rather than
-                  ;; editing an earlier one in place.  Captured before the
-                  ;; group-id helper assigns a group, so an in-place update
-                  ;; does not look new.
-                  (tool-newly-grouped
-                   (not (map-nested-elt state `(:tool-calls ,(map-nested-elt acp-notification '(params update toolCallId)) :group-id)))))
+            (let* ((diffs (map-nested-elt state `(:tool-calls ,(map-nested-elt acp-notification '(params update toolCallId)) :diffs)))
+                   (diff-text (agent-shell--tool-call-diff-text
+                               state
+                               (map-nested-elt acp-notification '(params update toolCallId))
+                               diffs))
+                   ;; Whether this update introduces a new tool call rather than
+                   ;; editing an earlier one in place.  Captured before the
+                   ;; group-id helper assigns a group, so an in-place update
+                   ;; does not look new.
+                   (tool-newly-grouped
+                    (not (map-nested-elt state `(:tool-calls ,(map-nested-elt acp-notification '(params update toolCallId)) :group-id)))))
              ;; Log tool call to transcript when completed or failed
              (when (and (map-nested-elt acp-notification '(params update status))
                         (member (map-nested-elt acp-notification '(params update status)) '("completed" "failed")))
@@ -2954,7 +2962,10 @@ No-op while that function has nothing to summarize (an empty group)."
                        :command (map-nested-elt state `(:tool-calls ,(map-nested-elt acp-notification '(params update toolCallId)) :command))
                        :parameters (agent-shell--extract-tool-parameters
                                     (map-nested-elt state `(:tool-calls ,(map-nested-elt acp-notification '(params update toolCallId)) :raw-input)))
-                       :output body-text)
+                       :output (agent-shell--make-tool-call-body
+                                :header nil
+                                :content (map-nested-elt acp-notification '(params update content))
+                                :diff-text diff-text))
                 :file-path agent-shell--transcript-file))
              ;; Hide permission after sending response.
              ;; Status is completed or failed so the user
@@ -2987,21 +2998,16 @@ No-op while that function has nothing to summarize (an empty group)."
                                             saved-input
                                             (not saved-command))
                                    (agent-shell--format-tool-call-input saved-input)))
-                    (full-body (cond
-                                (command-block
-                                 (concat command-block "\n\n" (string-trim body-text)))
-                                (input-block
-                                 (concat input-block "\n\n" (string-trim body-text)))
-                                (t
-                                 (string-trim body-text))))
                     ;; Tool output typically only grows: append the
                     ;; suffix rather than replacing and re-rendering the
-                    ;; whole body on every update (O(output^2) per
-                    ;; call).  Identical resends skip the body entirely.
+                    ;; whole body on every update.  Identical resends
+                    ;; skip the body entirely.
                     (body-update (agent-shell--tool-call-body-update
                                   :state state
                                   :tool-call-id tool-call-id
-                                  :full-body full-body)))
+                                  :header (or command-block input-block)
+                                  :content (map-nested-elt acp-notification '(params update content))
+                                  :diff-text diff-text)))
                (agent-shell--update-fragment
                 :state state
                 :block-id (map-nested-elt acp-notification '(params update toolCallId))
@@ -3014,7 +3020,6 @@ No-op while that function has nothing to summarize (an empty group)."
                 :append (map-elt body-update :append)
                 :expanded agent-shell-tool-use-expand-by-default
                 :above-last-prompt (not (agent-shell--active-requests-p state)))
-               (agent-shell--record-tool-call-body state tool-call-id full-body)
                (agent-shell--refresh-activity-group-header state group-id))
              ;; Only advance the run boundary when this update introduced a new
              ;; tool call (appended at the end).  An in-place update of an
@@ -3766,7 +3771,10 @@ of its activity group when grouped, so blocks and their
 `agent-shell-ui-state' text properties are never split.  The newest
 fragment (or activity group) is always kept intact."
   (when (and agent-shell-buffer-maximum-size
-             (> agent-shell-buffer-maximum-size 0))
+             (> agent-shell-buffer-maximum-size 0)
+             ;; Every line occupies at least one byte, so a buffer no
+             ;; larger than the line limit is necessarily under it.
+             (> (buffer-size) agent-shell-buffer-maximum-size))
     (save-restriction
       (widen)
       (save-mark-and-excursion
@@ -3801,7 +3809,7 @@ fragment (or activity group) is always kept intact."
                                (map-elt header :start)
                              (prop-match-beginning match)))))
           (when (> cut (point-min))
-            ;; Free the deleted fragments' cached range markers so they
+            ;; Free the deleted fragments' cached markers so they
             ;; don't linger in the buffer's marker list.
             (let ((pos (point-min)))
               (while (< pos cut)
@@ -3810,54 +3818,162 @@ fragment (or activity group) is always kept intact."
                                  pos 'agent-shell-ui-state nil cut)
                                 cut)))
                   (when state
-                    (agent-shell-ui--release-range-markers state))
+                    (agent-shell-ui--release-range-markers state)
+                    (agent-shell-ui--drop-fragment-location
+                     (map-elt state :qualified-id)))
                   (setq pos next))))
             (let ((inhibit-read-only t)
                   (buffer-undo-list t))
               (delete-region (point-min) cut))))))))
 
-(cl-defun agent-shell--tool-call-body-update (&key state tool-call-id full-body)
-  "Compute the incremental body update for TOOL-CALL-ID from FULL-BODY.
+(defun agent-shell--tool-call-diff-text (state tool-call-id diffs)
+  "Return DIFFS rendered as body text for TOOL-CALL-ID in STATE, or nil.
 
-Returns (:body BODY :append APPEND) — the suffix to append when the
-tool output only grew since the last update, a nil BODY to skip an
-identical resend, or the full body for a replacement (also when the
-fragment is gone from the buffer, e.g. truncated)."
-  (let* ((last-sent (map-nested-elt state (list :tool-calls tool-call-id :last-sent-body)))
+Cached on the tool call's `:body-render' record:
+`agent-shell--format-diffs-as-text' shells out to diff(1) per
+entry, so recompute only when DIFFS changed since the last render."
+  (let ((render (map-nested-elt state (list :tool-calls tool-call-id :body-render))))
+    (if (and render (equal (map-elt render :diffs) diffs))
+        (map-elt render :diff-text)
+      (agent-shell--format-diffs-as-text diffs))))
+
+(cl-defun agent-shell--make-tool-call-body (&key header content diff-text)
+  "Assemble a tool call's full body from HEADER, CONTENT, and DIFF-TEXT.
+
+HEADER is the fenced command (or formatted input) block prefix, or
+nil.  CONTENT is the raw ACP content list; each item's `content'
+value is rendered via `agent-shell--content-block-to-markdown' and
+joined with a blank line.  DIFF-TEXT (see
+`agent-shell--format-diffs-as-text') follows the output after an
+extra blank line.  The output/diff tail is whitespace-trimmed as a
+whole.
+
+For example:
+
+  (agent-shell--make-tool-call-body
+   :header \"```console\\nls -la\\n```\"
+   :content \\='(((content . ((type . \"text\") (text . \"file1\"))))
+               ((content . ((type . \"text\") (text . \"file2\")))))
+   :diff-text nil)
+  ;; => \"```console\\nls -la\\n```\\n\\nfile1\\n\\nfile2\""
+  (let* ((items-text (string-join
+                      (seq-keep (lambda (item)
+                                  (when-let* ((value (map-elt item 'content)))
+                                    (agent-shell--content-block-to-markdown value)))
+                                content)
+                      "\n\n"))
+         (tail (string-trim
+                (concat items-text
+                        (when diff-text
+                          (concat (unless (string-empty-p items-text) "\n\n\n\n")
+                                  diff-text))))))
+    (if header
+        (concat header "\n\n" tail)
+      tail)))
+
+(cl-defun agent-shell--tool-call-body-update (&key state tool-call-id header content diff-text)
+  "Compute the incremental body update for TOOL-CALL-ID.
+
+HEADER is the fenced command (or formatted input) block prefix, or
+nil.  CONTENT is the raw ACP content list from the notification.
+DIFF-TEXT is the rendered diff text from
+`agent-shell--tool-call-diff-text', or nil.
+
+Returns ((:body . BODY) (:append . APPEND)):
+
+- BODY nil: nothing changed since the last update; skip entirely.
+- APPEND non-nil: BODY is only the newly grown suffix.
+- Otherwise BODY is the full body for a replacement (also when the
+  fragment is gone from the buffer, e.g. truncated).
+
+Only newly arrived content is rendered: unchanged prefix items are
+detected via `equal' on the raw ACP items plus a `string-prefix-p'
+check on the final item's rendering, so a streaming tool call costs
+O(new output) per update instead of re-rendering the accumulated
+output.  Updates TOOL-CALL-ID's `:body-render' record in STATE as a
+side effect."
+  (let* ((tool-call (map-nested-elt state (list :tool-calls tool-call-id)))
+         (render (map-elt tool-call :body-render))
+         (kept (seq-keep (lambda (item) (map-elt item 'content)) content))
+         (old-items (map-elt render :items))
+         (old-count (length old-items))
+         (suffix-base
+          ;; The last rendered item as previously sent: its trailing
+          ;; whitespace was trimmed off the body's trailing edge.
+          (and (> old-count 0)
+               (string-trim-right
+                (agent-shell--content-block-to-markdown
+                 (nth (1- old-count) old-items)))))
+         (appendable
+          (and render
+               (equal (map-elt render :header) header)
+               (> old-count 0)
+               (>= (length kept) old-count)
+               ;; All items before the last rendered one are unchanged.
+               (equal (seq-take old-items (1- old-count))
+                      (seq-take kept (1- old-count)))
+               ;; The last rendered item only grew.
+               (not (string-empty-p (or suffix-base "")))
+               (string-prefix-p suffix-base
+                                (agent-shell--content-block-to-markdown
+                                 (nth (1- old-count) kept)))
+               ;; A previously sent diff sits at the end of the body, so
+               ;; any item growth would displace it: append only when the
+               ;; old body had no diff (a new one may now appear).
+               (null (map-elt render :diff-text))))
+         (suffix
+          (when appendable
+            (let ((pieces
+                   (append
+                    ;; Growth of the last rendered item.
+                    (list (substring (agent-shell--content-block-to-markdown
+                                      (nth (1- old-count) kept))
+                                     (length suffix-base)))
+                    ;; Brand new items.
+                    (mapcan (lambda (item)
+                              (list "\n\n" (agent-shell--content-block-to-markdown item)))
+                            (seq-drop kept old-count))
+                    ;; A newly appeared diff.
+                    (when diff-text
+                      (list "\n\n\n\n" diff-text)))))
+              ;; The body's trailing edge is whitespace-trimmed on send.
+              (string-trim-right (apply #'concat pieces)))))
          (fragment-exists
-          (and last-sent
+          (and render
                (with-current-buffer (map-elt state :buffer)
-                 (save-excursion
-                   (goto-char (point-max))
-                   (text-property-search-backward
-                    'agent-shell-ui-state nil
-                    (lambda (_ s)
-                      (equal (map-elt s :qualified-id)
-                             (format "%s-%s" (map-elt state :request-count)
-                                     tool-call-id)))
-                    t))))))
+                 (agent-shell-ui--block-start-by-id
+                  (format "%s-%s" (map-elt state :request-count) tool-call-id))))))
+    (if-let* ((tool-call (map-nested-elt state (list :tool-calls tool-call-id))))
+        (progn
+          (unless (assq :body-render tool-call)
+            (nconc tool-call (list (cons :body-render nil))))
+          (map-put! tool-call :body-render
+                    (list (cons :header header)
+                          (cons :items kept)
+                          (cons :diffs (map-elt tool-call :diffs))
+                          (cons :diff-text diff-text))))
+      (map-put! state :tool-calls
+                (cons (cons tool-call-id
+                            (list (cons :body-render
+                                        (list (cons :header header)
+                                              (cons :items kept)
+                                              (cons :diffs nil)
+                                              (cons :diff-text diff-text)))))
+                      (map-elt state :tool-calls))))
     (cond
-     ((equal full-body last-sent)
+     ((and appendable fragment-exists)
+      (if (string-empty-p suffix)
+          (list (cons :body nil) (cons :append nil))
+        (list (cons :body suffix) (cons :append t))))
+     ((and render
+           (equal (map-elt render :header) header)
+           (equal old-items kept)
+           (equal (map-elt render :diff-text) diff-text))
       (list (cons :body nil) (cons :append nil)))
-     ((and fragment-exists (string-prefix-p last-sent full-body))
-      (list (cons :body (substring full-body (length last-sent)))
-            (cons :append t)))
      (t
-      (list (cons :body full-body) (cons :append nil))))))
-
-(defun agent-shell--record-tool-call-body (state tool-call-id full-body)
-  "Remember FULL-BODY as the last body sent for TOOL-CALL-ID in STATE.
-The next `agent-shell--tool-call-body-update' diffs against it.  The
-tool-call alist is a plain list; its new key grows at the tail."
-  (if-let* ((tool-call (map-nested-elt state (list :tool-calls tool-call-id))))
-      (progn
-        (unless (assq :last-sent-body tool-call)
-          (nconc tool-call (list (cons :last-sent-body nil))))
-        (map-put! tool-call :last-sent-body full-body))
-    (map-put! state :tool-calls
-              (cons (cons tool-call-id
-                          (list (cons :last-sent-body full-body)))
-                    (map-elt state :tool-calls)))))
+      (list (cons :body (agent-shell--make-tool-call-body
+                         :header header :content content :diff-text diff-text))
+            (cons :append nil))))))
 
 (cl-defun agent-shell--make-error-handler (&key state shell-buffer)
   "Create ACP error handler with SHELL-BUFFER STATE."

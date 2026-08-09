@@ -134,13 +134,7 @@ O(accumulated-body).  Label-only updates leave the body untouched."
                  (padding-start nil)
                  (padding-end nil)
                  (group-header nil)
-                 (match (save-mark-and-excursion
-                          (goto-char (point-max))
-                          (text-property-search-backward
-                           'agent-shell-ui-state nil
-                           (lambda (_ state)
-                             (equal (map-elt state :qualified-id) qualified-id))
-                           t))))
+                 (found-start (agent-shell-ui--block-start-by-id qualified-id)))
             ;; Resolve group membership.  A NEW member materializes its
             ;; header (auto-create) and routes into the group's region.  An
             ;; EXISTING member keeps whatever group it already belongs to;
@@ -150,8 +144,8 @@ O(accumulated-body).  Label-only updates leave the body untouched."
             ;; Either way the resolved parent qualified-id and indent are
             ;; recorded on the model so insertion and body regeneration nest.
             (cond
-             ((and match (not create-new))
-              (when-let* ((state (get-text-property (prop-match-beginning match)
+             ((and found-start (not create-new))
+              (when-let* ((state (get-text-property found-start
                                                     'agent-shell-ui-state))
                           (existing-group (map-elt state :group-id)))
                 (setq model (append model
@@ -171,11 +165,11 @@ O(accumulated-body).  Label-only updates leave the body untouched."
             (when (or new-label-left new-label-right new-body)
               (cond
                ;; Existing block — apply edits per changed section.
-               ((and match (not create-new))
-                (let* ((state (get-text-property (prop-match-beginning match)
+               ((and found-start (not create-new))
+                (let* ((state (get-text-property found-start
                                                  'agent-shell-ui-state))
                        (collapsed (map-elt state :collapsed)))
-                  (setq block-start (prop-match-beginning match))
+                  (setq block-start found-start)
                   (save-excursion
                     (goto-char block-start)
                     (skip-chars-backward "\n")
@@ -201,8 +195,7 @@ O(accumulated-body).  Label-only updates leave the body untouched."
                            (current-block-end
                             (or (agent-shell-ui--range-marker-position range-markers :block-end)
                                 (map-elt (agent-shell-ui--block-range :position block-start)
-                                         :end)
-                                (prop-match-end match)))
+                                         :end)))
                            (existing-body-range
                             (or (agent-shell-ui--make-marker-range
                                  range-markers :body-start :body-end)
@@ -263,8 +256,20 @@ O(accumulated-body).  Label-only updates leave the body untouched."
                ;; group's trailing separator (after the header) already sits
                ;; below, so no trailing newlines are added here.
                ((map-elt model :group-qualified-id)
-                (goto-char (agent-shell-ui--group-insertion-point
-                            :group-qualified-id (map-elt model :group-qualified-id)))
+                (let ((insertion-point (agent-shell-ui--group-insertion-point
+                                        :group-qualified-id (map-elt model :group-qualified-id))))
+                  ;; The insertion point coincides with the previous
+                  ;; element's block end (the header's when empty, else the
+                  ;; last member's).  Inserting here would advance that
+                  ;; element's cached end markers past the new member,
+                  ;; corrupting its later updates — invalidate them so they
+                  ;; recompute on next access.
+                  (when-let* ((previous-state (and (> insertion-point (point-min))
+                                                   (get-text-property (1- insertion-point)
+                                                                      'agent-shell-ui-state))))
+                    (agent-shell-ui--release-range-markers previous-state)
+                    (map-put! previous-state :range-markers nil))
+                  (goto-char insertion-point))
                 (setq padding-start (point))
                 (agent-shell-ui--insert-read-only (agent-shell-ui--required-newlines 2))
                 (setq block-start (point))
@@ -478,20 +483,13 @@ region is rewritten — the other label, the indicator, and the body of
 the same block stay untouched, so block tagging and fragment identity
 are preserved across label updates."
   (when (stringp new-text)
-    (when-let* ((block-match
-                 (save-excursion
-                   (goto-char (point-max))
-                   (text-property-search-backward
-                    'agent-shell-ui-state nil
-                    (lambda (_ state)
-                      (equal (map-elt state :qualified-id) qualified-id))
-                    t)))
+    (when-let* ((block (agent-shell-ui--block-by-id qualified-id))
                 (region
                  (save-excursion
-                   (goto-char (prop-match-beginning block-match))
+                   (goto-char (map-elt block :start))
                    (when-let* ((m (text-property-search-forward
                                    'agent-shell-ui-section section t t)))
-                     (when (<= (prop-match-end m) (prop-match-end block-match))
+                     (when (<= (prop-match-end m) (map-elt block :end))
                        (cons (prop-match-beginning m)
                              (prop-match-end m))))))
                 ;; Skip the rewrite when the label already renders
@@ -538,18 +536,13 @@ When NO-UNDO is non-nil, disable undo recording for this operation."
     (let* ((inhibit-read-only t)
            (buffer-undo-list (if no-undo t buffer-undo-list))
            (qualified-id (format "%s-%s" namespace-id block-id))
-           (match (save-mark-and-excursion
-                    (goto-char (point-max))
-                    (text-property-search-backward
-                     'agent-shell-ui-state nil
-                     (lambda (_ state)
-                       (equal (map-elt state :qualified-id) qualified-id))
-                     t))))
-      (when match
-        (let ((block-start (prop-match-beginning match))
-              (block-end (prop-match-end match)))
+           (block (agent-shell-ui--block-by-id qualified-id)))
+      (when block
+        (let ((block-start (map-elt block :start))
+              (block-end (map-elt block :end)))
           (agent-shell-ui--release-range-markers
            (get-text-property block-start 'agent-shell-ui-state))
+          (agent-shell-ui--drop-fragment-location qualified-id)
           ;; Remove trailing vertical space that's part of the block, but
           ;; stop at the next fragment's content.  The next fragment's
           ;; leading indicator (e.g. the "  " collapse placeholder) is
@@ -669,6 +662,86 @@ the buffer's marker list."
   (dolist (cell (map-elt state :range-markers))
     (set-marker (cdr cell) nil)))
 
+(defvar-local agent-shell-ui--fragment-locations nil
+  "Table caching fragment block-start markers by qualified-id.
+
+A hash table rather than an alist: lookups sit on the
+per-notification hot path and must stay O(1) as fragments
+accumulate.  Entries are validated against the
+`agent-shell-ui-state' text property on every read, so stale
+entries (from regenerated or truncated fragments) are dropped and
+repopulated lazily; see `agent-shell-ui--block-start-by-id'.")
+
+(defun agent-shell-ui--fragment-locations ()
+  "Return the buffer-local fragment location table, creating if needed."
+  (or agent-shell-ui--fragment-locations
+      (setq agent-shell-ui--fragment-locations
+            (make-hash-table :test #'equal))))
+
+(defun agent-shell-ui--cache-fragment-location (qualified-id block-start)
+  "Cache BLOCK-START as the position of fragment QUALIFIED-ID."
+  (let ((table (agent-shell-ui--fragment-locations)))
+    (when-let* ((stale (gethash qualified-id table)))
+      (set-marker stale nil))
+    (puthash qualified-id (copy-marker block-start) table)))
+
+(defun agent-shell-ui--drop-fragment-location (qualified-id)
+  "Drop any cached location for fragment QUALIFIED-ID."
+  (when-let* ((marker (gethash qualified-id (agent-shell-ui--fragment-locations))))
+    (set-marker marker nil)
+    (remhash qualified-id (agent-shell-ui--fragment-locations))))
+
+(defun agent-shell-ui--block-start-by-id (qualified-id &optional direction)
+  "Return the block-start position of fragment QUALIFIED-ID, or nil.
+
+Consults the buffer-local location cache first, validating the
+cached marker against the `agent-shell-ui-state' text property.
+On a miss (or a stale entry, e.g. after regeneration or
+truncation), falls back to a property search and repopulates the
+cache: DIRECTION `forward' scans from `point-min', otherwise the
+search runs backward from `point-max'."
+  (let* ((table (agent-shell-ui--fragment-locations))
+         (cached (gethash qualified-id table))
+         (start (and cached
+                     (marker-position cached)
+                     (equal (map-elt (get-text-property cached 'agent-shell-ui-state)
+                                     :qualified-id)
+                            qualified-id)
+                     (marker-position cached))))
+    (unless start
+      (when cached
+        (set-marker cached nil)
+        (remhash qualified-id table))
+      (when-let* ((match (save-mark-and-excursion
+                           (if (eq direction 'forward)
+                               (progn
+                                 (goto-char (point-min))
+                                 (text-property-search-forward
+                                  'agent-shell-ui-state nil
+                                  (lambda (_ state)
+                                    (equal (map-elt state :qualified-id) qualified-id))
+                                  t))
+                             (goto-char (point-max))
+                             (text-property-search-backward
+                              'agent-shell-ui-state nil
+                              (lambda (_ state)
+                                (equal (map-elt state :qualified-id) qualified-id))
+                              t)))))
+        (setq start (prop-match-beginning match))
+        (puthash qualified-id (copy-marker start) table)))
+    start))
+
+(defun agent-shell-ui--block-by-id (qualified-id &optional direction)
+  "Return ((:start . S) (:end . E)) for fragment QUALIFIED-ID, or nil.
+
+The block end comes from a fresh property search rather than the
+fragment's cached `:block-end' marker: such a marker advances past
+text inserted at its position, which for a group header or last
+group member includes the next member's fragment."
+  (when-let* ((start (agent-shell-ui--block-start-by-id qualified-id direction))
+              (end (map-elt (agent-shell-ui--block-range :position start) :end)))
+    (list (cons :start start) (cons :end end))))
+
 (cl-defun agent-shell-ui--nearest-range-matching-property (&key property value (predicate t) from to)
   "Return nearest range where PREDICATE is non-nil for PROPERTY and VALUE."
   (save-mark-and-excursion
@@ -691,15 +764,12 @@ the buffer's marker list."
 
 (defun agent-shell-ui--group-header-range (group-qualified-id)
   "Return (:start :end) of the group header GROUP-QUALIFIED-ID, or nil."
-  (save-mark-and-excursion
-    (goto-char (point-min))
-    (when-let* ((match (text-property-search-forward
-                        'agent-shell-ui-state nil
-                        (lambda (_ state)
-                          (and (equal (map-elt state :qualified-id) group-qualified-id)
-                               (eq (map-elt state :kind) 'group)))
-                        t)))
-      (agent-shell-ui--block-range :position (prop-match-beginning match)))))
+  (when-let* ((block (agent-shell-ui--block-by-id group-qualified-id 'forward))
+              ((eq (map-elt (get-text-property (map-elt block :start)
+                                               'agent-shell-ui-state)
+                            :kind)
+                   'group)))
+    block))
 
 (cl-defun agent-shell-ui--group-children (&key group-qualified-id)
   "Return ordered member block ranges of group GROUP-QUALIFIED-ID.
@@ -1002,7 +1072,8 @@ indents a member's header line under its group header."
                                                  ;; Default to auto
                                                  (and body indicator-start))))))
     (put-text-property block-start (or body-end label-right-end label-left-end) 'read-only t)
-    (put-text-property block-start (or body-end label-right-end label-left-end) 'front-sticky '(read-only))))
+    (put-text-property block-start (or body-end label-right-end label-left-end) 'front-sticky '(read-only))
+    (agent-shell-ui--cache-fragment-location qualified-id block-start)))
 
 (cl-defun agent-shell-ui-update-text (&key namespace-id block-id text append create-new no-undo)
   "Update or insert a plain text entry identified by NAMESPACE-ID and BLOCK-ID.
@@ -1018,33 +1089,30 @@ When NO-UNDO is non-nil, disable undo recording."
            (props `(agent-shell-ui-state ((:qualified-id . ,qualified-id))
                                          read-only t
                                          front-sticky (read-only)))
-           (match (save-mark-and-excursion
-                    (goto-char (point-max))
-                    (text-property-search-backward
-                     'agent-shell-ui-state nil
-                     (lambda (_ state)
-                       (equal (map-elt state :qualified-id) qualified-id))
-                     t))))
+           (block-start (agent-shell-ui--block-start-by-id qualified-id))
+           (block-end (and block-start
+                           (map-elt (agent-shell-ui--block-range :position block-start)
+                                    :end))))
       (when text
         (cond
          ;; Append to existing entry.
-         ((and match (not create-new) append)
-          (goto-char (prop-match-end match))
+         ((and block-start (not create-new) append)
+          (goto-char block-end)
           (insert (apply #'propertize text props))
-          (list (cons :block (list (cons :start (prop-match-beginning match))
+          (list (cons :block (list (cons :start block-start)
                                    (cons :end (point))))
-                (cons :padding (list (cons :start (prop-match-beginning match))
+                (cons :padding (list (cons :start block-start)
                                      (cons :end (point))))))
          ;; Replace existing entry.
-         ((and match (not create-new))
+         ((and block-start (not create-new))
           (let ((padding-start (save-excursion
-                                 (goto-char (prop-match-beginning match))
+                                 (goto-char block-start)
                                  (skip-chars-backward "\n")
                                  (point))))
-            (delete-region (prop-match-beginning match) (prop-match-end match))
-            (goto-char (prop-match-beginning match))
+            (delete-region block-start block-end)
+            (goto-char block-start)
             (insert (apply #'propertize text props))
-            (list (cons :block (list (cons :start (prop-match-beginning match))
+            (list (cons :block (list (cons :start block-start)
                                      (cons :end (point))))
                   (cons :padding (list (cons :start padding-start)
                                        (cons :end (point)))))))
@@ -1055,6 +1123,7 @@ When NO-UNDO is non-nil, disable undo recording."
             (agent-shell-ui--insert-read-only (agent-shell-ui--required-newlines 2))
             (let ((block-start (point)))
               (insert (apply #'propertize text props))
+              (agent-shell-ui--cache-fragment-location qualified-id block-start)
               (list (cons :block (list (cons :start block-start)
                                        (cons :end (point))))
                     (cons :padding (list (cons :start padding-start)
@@ -1153,14 +1222,10 @@ state-property range first.  User-facing toggling goes through
 (defun agent-shell-ui-collapse-fragment-by-id (namespace-id block-id)
   "Collapse fragment with NAMESPACE-ID and BLOCK-ID."
   (save-mark-and-excursion
-    (let ((qualified-id (format "%s-%s" namespace-id block-id)))
-      (goto-char (point-max))
-      (when (text-property-search-backward
-             'agent-shell-ui-state qualified-id
-             (lambda (_ state)
-               (equal (map-elt state :qualified-id) qualified-id))
-             t)
-        (agent-shell-ui--toggle-fragment-at-point)))))
+    (when-let* ((block-start (agent-shell-ui--block-start-by-id
+                              (format "%s-%s" namespace-id block-id))))
+      (goto-char block-start)
+      (agent-shell-ui--toggle-fragment-at-point))))
 
 (defvar-local agent-shell-ui--fold-toggle-state nil
   "Current global fold state for the buffer.
