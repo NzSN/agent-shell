@@ -237,13 +237,20 @@ O(accumulated-body).  Label-only updates leave the body untouched."
                                              (map-elt model :group-qualified-id))
                                        (cons :group-indent
                                              (map-elt model :group-indent)))))
-                           ;; The regenerate swaps in a fresh state (fresh
-                           ;; markers); release the old ones first.
-                           (agent-shell-ui--release-range-markers state)
-                           (delete-region block-start current-block-end)
-                           (goto-char block-start)
-                           (agent-shell-ui--insert-fragment
-                            final-model qualified-id (not collapsed) navigation))))))
+                            ;; The regenerate swaps in a fresh state (fresh
+                            ;; markers); release the old ones first.
+                            (agent-shell-ui--release-range-markers state)
+                            (delete-region block-start current-block-end)
+                            (goto-char block-start)
+                            (agent-shell-ui--insert-fragment
+                             final-model qualified-id (not collapsed) navigation)
+                            ;; Regenerated under a folded header: the fresh
+                            ;; chars arrive visible, so hide just this
+                            ;; member rather than refolding the whole
+                            ;; group region.
+                            (when (agent-shell-ui--group-collapsed-p
+                                   (map-elt model :group-qualified-id))
+                              (put-text-property block-start (point) 'invisible t)))))))
                   (setq padding-end
                         (or (agent-shell-ui--range-marker-position
                              (agent-shell-ui--fragment-range-markers state block-start)
@@ -279,7 +286,13 @@ O(accumulated-body).  Label-only updates leave the body untouched."
                 ;; this member's padding so it is not stranded outside every
                 ;; block's range.
                 (skip-chars-forward "\n")
-                (setq padding-end (point)))
+                (setq padding-end (point))
+                ;; A member born under a folded header arrives visible;
+                ;; hide just the new member rather than refolding the
+                ;; whole group region (O(siblings) per insert, issue #757).
+                (when (agent-shell-ui--group-collapsed-p
+                       (map-elt model :group-qualified-id))
+                  (put-text-property padding-start padding-end 'invisible t)))
                ;; New block.
                (t
                 (goto-char (point-max))
@@ -289,17 +302,6 @@ O(accumulated-body).  Label-only updates leave the body untouched."
                 (agent-shell-ui--insert-fragment model qualified-id effective-expanded navigation)
                 (agent-shell-ui--insert-read-only "\n\n")
                 (setq padding-end (point)))))
-            ;; A collapsed group's members must stay hidden across updates.
-            ;; A member's own edit path (insert, or replace-label/body on an
-            ;; update) restores visibility from the member's own state, which
-            ;; would reveal it under a folded header; re-apply the group
-            ;; collapse so updates don't leak members onto the header line.
-            (when-let* ((group-qid (map-elt model :group-qualified-id))
-                        (header (agent-shell-ui--group-header-range group-qid))
-                        (header-state (get-text-property (map-elt header :start)
-                                                         'agent-shell-ui-state))
-                        ((map-elt header-state :collapsed)))
-              (agent-shell-ui--set-group-collapsed group-qid t))
             (when on-post-process
               (funcall on-post-process))
             (when-let* ((ranges (or (agent-shell-ui--fragment-ranges block-start)
@@ -506,7 +508,12 @@ are preserved across label updates."
                                (buffer-substring-no-properties (car region) (cdr region))))))
       (let* ((region-start (car region))
              (region-end (cdr region))
-             (state (get-text-property region-start 'agent-shell-ui-state)))
+             (state (get-text-property region-start 'agent-shell-ui-state))
+             ;; A label rewritten under a folded group must stay hidden:
+             ;; carry `invisible' over to the new chars explicitly rather
+             ;; than trusting stickiness, so the rewrite alone cannot
+             ;; leak the member onto the group header line.
+             (invisible (get-text-property region-start 'invisible)))
         (delete-region region-start region-end)
         (goto-char region-start)
         (let ((insert-start (point)))
@@ -525,7 +532,9 @@ are preserved across label updates."
                                                           front-sticky (read-only)))
             (when state
               (put-text-property insert-start insert-end
-                                 'agent-shell-ui-state state))))))))
+                                 'agent-shell-ui-state state))
+            (when invisible
+              (put-text-property insert-start insert-end 'invisible invisible))))))))
 
 
 (cl-defun agent-shell-ui-delete-fragment (&key namespace-id block-id no-undo)
@@ -771,6 +780,14 @@ group member includes the next member's fragment."
                    'group)))
     block))
 
+(defun agent-shell-ui--group-collapsed-p (group-qualified-id)
+  "Return non-nil when group GROUP-QUALIFIED-ID's header is folded.
+Nil GROUP-QUALIFIED-ID (a block with no group) never counts as folded."
+  (when-let* ((group-qualified-id)
+              (header (agent-shell-ui--group-header-range group-qualified-id)))
+    (map-elt (get-text-property (map-elt header :start) 'agent-shell-ui-state)
+             :collapsed)))
+
 (cl-defun agent-shell-ui--group-children (&key group-qualified-id)
   "Return ordered member block ranges of group GROUP-QUALIFIED-ID.
 Each element is (:qualified-id ID :start S :end E).  Members are the
@@ -894,10 +911,19 @@ expanding reveals it and restores each member's own fold state."
                        :group-qualified-id group-qualified-id))
               (state (get-text-property (map-elt header :start) 'agent-shell-ui-state)))
     (if collapsed
-        (put-text-property (map-elt region :start) (map-elt region :end)
-                           'invisible t)
-      (put-text-property (map-elt region :start) (map-elt region :end)
-                         'invisible nil)
+        ;; Reflag only chars not already hidden: `put-text-property'
+        ;; reports the full range it is handed as modified even when the
+        ;; value is unchanged, and a collapsed group's region holds
+        ;; streamed bodies, so a redundant refold sent the whole region
+        ;; to jit-lock on every repeat (issue #757).
+        (when-let* ((visible (text-property-not-all (map-elt region :start)
+                                                    (map-elt region :end)
+                                                    'invisible t)))
+          (put-text-property visible (map-elt region :end) 'invisible t))
+      (when-let* ((hidden (text-property-not-all (map-elt region :start)
+                                                 (map-elt region :end)
+                                                 'invisible nil)))
+        (put-text-property hidden (map-elt region :end) 'invisible nil))
       (dolist (child (agent-shell-ui--group-children
                       :group-qualified-id group-qualified-id))
         (agent-shell-ui--apply-own-collapsed (map-elt child :start))))
