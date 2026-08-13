@@ -178,7 +178,6 @@ O(accumulated-body).  Label-only updates leave the body untouched."
                                        expanded))
                  (block-start nil)
                  (body-range nil)
-                 (wrote-hidden nil)
                  (padding-start nil)
                  (padding-end nil)
                  (group-header nil)
@@ -282,14 +281,8 @@ O(accumulated-body).  Label-only updates leave the body untouched."
                        ((and append existing-body-range)
                         ;; `--append-body' hides what it writes whenever the
                         ;; body it extends is hidden, so an append into a
-                        ;; folded child leaves nothing exposed and the
-                        ;; group's fold below can be left alone.
-                        (setq wrote-hidden
-                              (and (not new-label-left)
-                                   (not new-label-right)
-                                   (agent-shell-ui--body-invisible-p
-                                    (map-elt existing-body-range :start)
-                                    (map-elt existing-body-range :end))))
+                        ;; folded child leaves nothing exposed and needs no
+                        ;; refold of the group.
                         (setq body-range
                               (or (agent-shell-ui--append-body
                                    existing-body-range new-body qualified-id collapsed)
@@ -329,7 +322,13 @@ O(accumulated-body).  Label-only updates leave the body untouched."
                           (delete-region block-start current-block-end)
                           (goto-char block-start)
                           (agent-shell-ui--insert-fragment
-                           final-model qualified-id (not collapsed) navigation))))))
+                           final-model qualified-id (not collapsed) navigation)
+                          ;; Regenerated under a folded header: the fresh
+                          ;; chars arrive visible, so hide just this child
+                          ;; rather than refolding the whole group region.
+                          (when (agent-shell-ui--group-collapsed-p
+                                 (map-elt model :group-qualified-id))
+                            (put-text-property block-start (point) 'invisible t)))))))
                   (setq padding-end (or (marker-position block-end) (point)))))
                ;; New group child, inserted into the group's region.  The
                ;; group's trailing separator (after the header) already sits
@@ -346,7 +345,13 @@ O(accumulated-body).  Label-only updates leave the body untouched."
                 ;; this child's padding so it is not stranded outside every
                 ;; block's range.
                 (skip-chars-forward "\n")
-                (setq padding-end (point)))
+                (setq padding-end (point))
+                ;; A child born under a folded header arrives visible;
+                ;; hide just the new child rather than refolding the
+                ;; whole group region (O(siblings) per insert, issue #757).
+                (when (agent-shell-ui--group-collapsed-p
+                       (map-elt model :group-qualified-id))
+                  (put-text-property padding-start padding-end 'invisible t)))
                ;; New block.
                (t
                 (goto-char (point-max))
@@ -356,24 +361,6 @@ O(accumulated-body).  Label-only updates leave the body untouched."
                 (agent-shell-ui--insert-fragment model qualified-id effective-expanded navigation)
                 (agent-shell-ui--insert-read-only "\n\n")
                 (setq padding-end (point)))))
-            ;; A collapsed group's children must stay hidden across updates.
-            ;; A child's own edit path (insert, or replace-label/body on an
-            ;; update) restores visibility from the child's own state, which
-            ;; would reveal it under a folded header; re-apply the group
-            ;; collapse so updates don't leak children onto the header line.
-            ;;
-            ;; Skipped when the update only appended to an already hidden
-            ;; body, which hides its own chars.  Re-applying then costs a
-            ;; pass over the whole child region, and that region holds the
-            ;; streamed body, so a folded group paid O(chunks so far) on
-            ;; every chunk (issue #757).
-            (when-let* (((not wrote-hidden))
-                        (group-qid (map-elt model :group-qualified-id))
-                        (header (agent-shell-ui--group-header-range group-qid))
-                        (header-state (get-text-property (map-elt header :start)
-                                                         'agent-shell-ui-state))
-                        ((map-elt header-state :collapsed)))
-              (agent-shell-ui--set-group-collapsed group-qid t))
             (when on-post-process
               (funcall on-post-process))
             (when-let* ((block-range (if block-end
@@ -607,20 +594,28 @@ region is rewritten — the other label, the indicator, and the body of
 the same block stay untouched, so block tagging and fragment identity
 are preserved across label updates."
   (when (stringp new-text)
-    (when-let* ((block-match
-                 (save-excursion
-                   (goto-char (point-max))
-                   (text-property-search-backward
-                    'agent-shell-ui-state nil
-                    (lambda (_ state)
-                      (equal (map-elt state :qualified-id) qualified-id))
-                    t)))
+    (when-let* ((block-range
+                 ;; Label updates re-send on every tool-call chunk, so
+                 ;; answer from the block cache where possible; the
+                 ;; search below walks the buffer's accumulated property
+                 ;; intervals, which grow per streamed chunk (issue #757).
+                 (or (agent-shell-ui--cached-block qualified-id)
+                     (when-let* ((match
+                                  (save-excursion
+                                    (goto-char (point-max))
+                                    (text-property-search-backward
+                                     'agent-shell-ui-state nil
+                                     (lambda (_ state)
+                                       (equal (map-elt state :qualified-id) qualified-id))
+                                     t))))
+                       (list (cons :start (prop-match-beginning match))
+                             (cons :end (prop-match-end match))))))
                 (region
                  (save-excursion
-                   (goto-char (prop-match-beginning block-match))
+                   (goto-char (map-elt block-range :start))
                    (when-let* ((m (text-property-search-forward
                                    'agent-shell-ui-section section t t)))
-                     (when (<= (prop-match-end m) (prop-match-end block-match))
+                     (when (<= (prop-match-end m) (map-elt block-range :end))
                        (cons (prop-match-beginning m)
                              (prop-match-end m))))))
                 ;; Skip the rewrite when the label already renders
@@ -633,7 +628,12 @@ are preserved across label updates."
                        new-text section (car region) (cdr region)))))
       (let* ((region-start (car region))
              (region-end (cdr region))
-             (state (get-text-property region-start 'agent-shell-ui-state)))
+             (state (get-text-property region-start 'agent-shell-ui-state))
+             ;; A label rewritten under a folded group must stay hidden:
+             ;; carry `invisible' over to the new chars explicitly rather
+             ;; than trusting stickiness, so the rewrite alone cannot
+             ;; leak the child onto the group header line.
+             (invisible (get-text-property region-start 'invisible)))
         (delete-region region-start region-end)
         (goto-char region-start)
         (let ((insert-start (point)))
@@ -648,7 +648,9 @@ are preserved across label updates."
                                                           front-sticky (read-only)))
             (when state
               (put-text-property insert-start insert-end
-                                 'agent-shell-ui-state state))))))))
+                                 'agent-shell-ui-state state))
+            (when invisible
+              (put-text-property insert-start insert-end 'invisible invisible))))))))
 
 
 (cl-defun agent-shell-ui-delete-fragment (&key namespace-id block-id no-undo)
@@ -866,6 +868,14 @@ turn's cost grew with everything already in the buffer (issue #757)."
         (agent-shell-ui--cache-block group-qualified-id range)
         range)))
 
+(defun agent-shell-ui--group-collapsed-p (group-qualified-id)
+  "Return non-nil when group GROUP-QUALIFIED-ID's header is folded.
+Nil GROUP-QUALIFIED-ID (a block with no group) never counts as folded."
+  (when-let* ((group-qualified-id)
+              (header (agent-shell-ui--group-header-range group-qualified-id)))
+    (map-elt (get-text-property (map-elt header :start) 'agent-shell-ui-state)
+             :collapsed)))
+
 (cl-defun agent-shell-ui--group-children (&key group-qualified-id)
   "Return ordered child block ranges of group GROUP-QUALIFIED-ID.
 Each element is (:qualified-id ID :start S :end E).  Children are the
@@ -902,6 +912,51 @@ equal to GROUP-QUALIFIED-ID; the run stops at the first non-child."
                 (setq pos (map-elt block :end))))))
         (nreverse children)))))
 
+(defvar-local agent-shell-ui--group-end-cache nil
+  "Child-region end markers for the most recently walked groups.
+
+An alist of group-qualified-id to marker, most recent first.  The
+marker has insertion type t, so appends to a group's last child —
+including a streamed body growing chunk by chunk — advance it for free.
+
+Buffer-local and capped at a handful of entries for the same reasons
+as `agent-shell-ui--block-cache': streaming revisits few groups, and
+every live marker costs a little on each insertion.")
+
+(defun agent-shell-ui--cached-group-end (group-qualified-id from)
+  "Return GROUP-QUALIFIED-ID's cached child-region end, or nil.
+
+Valid only when the marker sits past FROM (the header block's end) and
+the char just before it still belongs to a child of the group.  Like
+`agent-shell-ui--cached-block', entries are verified on every use
+rather than invalidated on buffer change: a viewport rebuild collapses
+every marker to `point-min', and either check sends the caller back to
+walking."
+  (when-let* ((marker (map-elt agent-shell-ui--group-end-cache group-qualified-id))
+              (pos (marker-position marker))
+              ((> pos from))
+              ((<= pos (point-max)))
+              ((equal (map-elt (get-text-property (1- pos) 'agent-shell-ui-state)
+                               :group-id)
+                      group-qualified-id)))
+    pos))
+
+(defun agent-shell-ui--cache-group-end (group-qualified-id end)
+  "Record END as GROUP-QUALIFIED-ID's child-region end.
+Replaces any entry already held for the group, and drops the oldest
+once more than a handful are cached.  See `agent-shell-ui--group-end-cache'."
+  (when-let* ((stale (map-elt agent-shell-ui--group-end-cache group-qualified-id)))
+    (set-marker stale nil))
+  (setq agent-shell-ui--group-end-cache
+        (cons (cons group-qualified-id (copy-marker end t))
+              (assoc-delete-all group-qualified-id
+                                agent-shell-ui--group-end-cache)))
+  (when (> (length agent-shell-ui--group-end-cache) 8)
+    (let ((oldest (car (last agent-shell-ui--group-end-cache))))
+      (set-marker (cdr oldest) nil)
+      (setq agent-shell-ui--group-end-cache
+            (assoc-delete-all (car oldest) agent-shell-ui--group-end-cache)))))
+
 (defun agent-shell-ui--group-children-end (group-qualified-id from)
   "Return the end of the last child in group with GROUP-QUALIFIED-ID.
 Nil when the group has no children.
@@ -916,28 +971,30 @@ preceding the first child).
 Callers needing only that one position use this: enumerating costs a
 block walk per child, and runs on every insertion and on every update
 under a collapsed group (issue #757)."
-  (save-mark-and-excursion
-    (goto-char from)
-    (let ((end from))
-      (catch 'done
-        (while t
-          (skip-chars-forward " \t\n")
-          (when (eobp)
-            (throw 'done nil))
-          (unless (equal (map-elt (get-text-property (point) 'agent-shell-ui-state)
-                                  :group-id)
-                         group-qualified-id)
-            (throw 'done nil))
-          ;; Step over this child's state run.  A non-advancing change
-          ;; position would spin forever, so stop on one.
-          (let ((next (next-single-property-change (point) 'agent-shell-ui-state
-                                                   nil (point-max))))
-            (unless (> next (point))
-              (throw 'done nil))
-            (goto-char next)
-            (setq end next))))
-      (unless (= end from)
-        end))))
+  (or (agent-shell-ui--cached-group-end group-qualified-id from)
+      (save-mark-and-excursion
+        (goto-char from)
+        (let ((end from))
+          (catch 'done
+            (while t
+              (skip-chars-forward " \t\n")
+              (when (eobp)
+                (throw 'done nil))
+              (unless (equal (map-elt (get-text-property (point) 'agent-shell-ui-state)
+                                      :group-id)
+                             group-qualified-id)
+                (throw 'done nil))
+              ;; Step over this child's state run.  A non-advancing change
+              ;; position would spin forever, so stop on one.
+              (let ((next (next-single-property-change (point) 'agent-shell-ui-state
+                                                       nil (point-max))))
+                (unless (> next (point))
+                  (throw 'done nil))
+                (goto-char next)
+                (setq end next))))
+          (unless (= end from)
+            (agent-shell-ui--cache-group-end group-qualified-id end)
+            end)))))
 
 (cl-defun agent-shell-ui--group-child-region (&key group-qualified-id)
   "Return (:start :end) spanning group GROUP-QUALIFIED-ID's children, or nil.
@@ -1027,10 +1084,19 @@ expanding reveals it and restores each child's own fold state."
                        :group-qualified-id group-qualified-id))
               (state (get-text-property (map-elt header :start) 'agent-shell-ui-state)))
     (if collapsed
-        (put-text-property (map-elt region :start) (map-elt region :end)
-                           'invisible t)
-      (put-text-property (map-elt region :start) (map-elt region :end)
-                         'invisible nil)
+        ;; Reflag only chars not already hidden: `put-text-property'
+        ;; reports the full range it is handed as modified even when the
+        ;; value is unchanged, and a collapsed group's region holds
+        ;; streamed bodies, so a redundant refold sent the whole region
+        ;; to jit-lock on every repeat (issue #757).
+        (when-let* ((visible (text-property-not-all (map-elt region :start)
+                                                    (map-elt region :end)
+                                                    'invisible t)))
+          (put-text-property visible (map-elt region :end) 'invisible t))
+      (when-let* ((hidden (text-property-not-all (map-elt region :start)
+                                                 (map-elt region :end)
+                                                 'invisible nil)))
+        (put-text-property hidden (map-elt region :end) 'invisible nil))
       (dolist (child (agent-shell-ui--group-children
                       :group-qualified-id group-qualified-id))
         (agent-shell-ui--apply-own-collapsed (map-elt child :start))))
